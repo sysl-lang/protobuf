@@ -13,6 +13,8 @@ Protocol Buffers for [sysl](https://github.com/sysl-lang/sysl), written in sysl 
   package;
 - **`protoc-sysl`**, a command a few lines long over the last two.
 
+*An independent sysl package for Protocol Buffers. It is not affiliated with or endorsed by Protocol Buffers' authors or trademark holders.*
+
 ```
 sh/sysl/protobuf/            the runtime: wire.sysl, output.sysl, reader.sysl, codec.sysl
 sh/sysl/protobuf/schema/     the reader: model, parse, resolve, load
