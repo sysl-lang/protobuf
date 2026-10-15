@@ -18,7 +18,7 @@ same failure happens for `self.one[N]()` inside a trait default. **Effect:** the
 are codec associated functions (`Int32.field(out, 1, v)`), not the planned `out.field[Int32](1, v)`.
 Revisit that API when this is fixed.
 
-**Status: reported to `sysl`.**
+**Status: accepted for alpha.14** (sysl branch `type-args-select`).
 
 ## 2. `heap = false` checks code nothing reaches (gap)
 
@@ -29,7 +29,8 @@ generator cannot move to a second package either, because `sh.sysl.protobuf.sche
 another package (nested module names collide). Meanwhile the freestanding probe builds without
 `heap = false`, and its thumb archive still references `malloc`/`free`.
 
-**Status: reported to `sysl`.**
+**Status: accepted for alpha.14** (sysl branch `heap-reach`: reach followed function by function,
+extending alpha.13's module-level fix, and finding where the `malloc`/`free` references come from).
 
 ## 3. An associated function of an instantiated generic type cannot be called (gap)
 
@@ -39,7 +40,7 @@ another package (nested module names collide). Meanwhile the freestanding probe 
 **WORKAROUND TAKEN — remove when fixed:** every generated file ends with aliases such as
 `type XCodec = MessageOf[X]`.
 
-**Status: reported to `sysl`.**
+**Status: accepted for alpha.14** (sysl branch `type-args-select`: `Of[int].twice()` becomes legal).
 
 ## 4. A trait default's signature is resolved in the implementing module (bug)
 
@@ -49,30 +50,30 @@ does not: `error: unknown type 'Buf'`, pointing at an unrelated line of the impl
 **WORKAROUND TAKEN — remove when fixed:** the generator always imports `sysl.buf.Buf` (the
 `g.sb("Buf")` line in `gen.sysl`'s `message()`).
 
-**Status: reported to `sysl`.**
+**Status: accepted for alpha.14** (sysl branch `trait-default-scope`).
 
 ## 5. `&T` has no `Display` even when `T` has (gap)
 
 `derives Display` on a struct holding `Option[&Node]` fails. That blocks boxing a message that contains
 itself, so the generator refuses such messages with a diagnostic for now.
 
-**Status: reported to `sysl`.**
+**Status: fixed in alpha.13** (`&T` is `Display` when `T` is). Recheck `Option[&Node]` there.
 
 ## 6. `unit` has no `Eq` or `Display` (gap)
 
 `assert_eq(x, Ok(()))` on a `Result[unit, E]` is refused. The tests compare `.err()`. The same as
 `sysl-lang/fat`'s FINDINGS 5.
 
-**Status: queued for alpha.14.**
+**Status: fixed in alpha.13.**
 
 ## 7. `[]int == []const int` is refused (gap)
 
 Comparing only reads, but the conversion rule refuses it. The tests compare element by element.
 
-**Status: reported to `sysl`.**
+**Status: accepted for alpha.14** (sysl branch `small-diags`).
 
 ## 8. A reserved word as a field name gives a misleading diagnostic
 
 `g.module` reports `error: tuple index expected` instead of naming the reserved word.
 
-**Status: reported to `sysl`.**
+**Status: accepted for alpha.14** (sysl branch `small-diags`).
