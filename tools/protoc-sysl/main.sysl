@@ -1,0 +1,10 @@
+// protoc-sysl — generate sysl from .proto files.
+//
+//   protoc-sysl [-I <dir>]... --out <dir> [--check] <file.proto>...
+
+import sh.sysl.protobuf.gen.run_cli
+
+main(args: []string)
+    val outcome = run_cli(args[1..])
+    if outcome.text != "" then print(outcome.text)
+    exit(outcome.status)

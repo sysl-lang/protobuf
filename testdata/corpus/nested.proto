@@ -1,0 +1,59 @@
+// Scopes: a type shadowing an outer one, names found outward from deep inside, qualified and fully
+// qualified references, enums with aliases and negative values, reserved ranges, json_name, proto3
+// optional, oneofs and maps of messages.
+syntax = "proto3";
+
+package corpus.nested;
+
+import "corpus/base.proto";
+
+message Thing {
+  int64 id = 1;
+}
+
+message Outer {
+  // Shadows the top-level Thing everywhere inside Outer.
+  message Thing {
+    string label = 1;
+  }
+
+  message Middle {
+    message Inner {
+      Thing shadowed = 1;
+      .corpus.nested.Thing top = 2;
+      Outer.Thing qualified = 3;
+      Kind kind = 4;
+      corpus.base.Shared shared = 5;
+    }
+
+    Inner inner = 1;
+    repeated Inner inners = 2;
+    map<string, Inner> by_name = 3;
+  }
+
+  enum Kind {
+    option allow_alias = true;
+    KIND_NONE = 0;
+    KIND_ONE = 1;
+    KIND_UNO = 1;
+    KIND_MINUS = -7;
+    reserved 5 to 9, 100;
+    reserved "KIND_OLD";
+  }
+
+  Thing thing = 1;
+  Middle middle = 2;
+  optional int32 opt_number = 3;
+  optional Kind opt_kind = 4;
+  oneof choice {
+    string text = 5;
+    Middle nested_middle = 6;
+  }
+  int32 snake_case_name = 7;
+  string renamed = 8 [json_name = "customName"];
+  map<int64, Thing> things = 9;
+  repeated Kind kinds = 10 [packed = false];
+  reserved 11, 15 to 20, 1000 to max;
+  reserved "gone", "also_gone";
+  corpus.base.Status status = 12;
+}

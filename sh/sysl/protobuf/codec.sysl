@@ -1,0 +1,366 @@
+module sh.sysl.protobuf
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8
+
+/** How one of protobuf's field types is carried: which sysl type holds it, which wire type it travels
+ * as, and how it is measured, written and read.
+ *
+ * Each implementation is a type with no fields that stands for one `.proto` type — `Int32`, `SInt32`,
+ * `Str` — and every field shape is written once, here, for all of them. So a generated message says
+ * what each field is by naming its codec, one line per field:
+ *
+ *     SInt64.field(out, 3, self.offset)?
+ *     Fixed32.packed(out, 4, self.samples.view())?
+ *     3 -> self.offset = SInt64.read(r, f)?
+ *
+ * An implementation supplies the first six members; `size` is the bytes of the value alone, after the
+ * tag, and a length-delimited value's includes its length prefix. The shapes:
+ *
+ * | member | writes | for |
+ * |---|---|---|
+ * | `field` | the field, unless its value is the default | a proto3 field without `optional` |
+ * | `present` | the field, always | a `oneof` member that is set, a map entry's key and value |
+ * | `optional` | the field when there is one | a proto3 `optional` field, a sub-message |
+ * | `repeated` | one field per element | a repeated string, bytes or message |
+ * | `packed` | one length-delimited run of every element | a repeated number, the proto3 default |
+ *
+ * each with a `_size` beside it that measures what it would write.
+ */
+trait Codec
+    type Value
+    static wire -> WireType
+    is_default(v: Self::Value) -> bool
+    size(v: Self::Value) -> usize
+    put[O: Output](out: *O, v: Self::Value) -> Result[unit, EncodeError]
+    get(r: *Reader) -> Result[Self::Value, DecodeError]
+
+    field[O: Output](out: *O, number: u32, v: Self::Value) -> Result[unit, EncodeError]
+        if Self.is_default(v) then return Ok(())
+        Self.present(out, number, v)
+
+    present[O: Output](out: *O, number: u32, v: Self::Value) -> Result[unit, EncodeError]
+        out.tag(number, Self.wire)?
+        Self.put(out, v)
+
+    optional[O: Output](out: *O, number: u32, v: Option[Self::Value]) -> Result[unit, EncodeError]
+        v match
+            Some(x) -> Self.present(out, number, x)
+            None -> Ok(())
+
+    repeated[O: Output](out: *O, number: u32, xs: []const Self::Value) -> Result[unit, EncodeError]
+        for x in xs
+            Self.present(out, number, x)?
+        Ok(())
+
+    packed[O: Output](out: *O, number: u32, xs: []const Self::Value) -> Result[unit, EncodeError]
+        if xs.len == 0 then return Ok(())
+        out.tag(number, Len)?
+        out.varint(u64(Self.run_size(xs)))?
+        for x in xs
+            Self.put(out, x)?
+        Ok(())
+
+    field_size(number: u32, v: Self::Value) -> usize =
+        if Self.is_default(v) then 0 else Self.present_size(number, v)
+
+    present_size(number: u32, v: Self::Value) -> usize = varint_size(tag_of(number, Self.wire)) + Self.size(v)
+
+    optional_size(number: u32, v: Option[Self::Value]) -> usize = v match
+        Some(x) -> Self.present_size(number, x)
+        None -> 0
+
+    repeated_size(number: u32, xs: []const Self::Value) -> usize
+        var n: usize = 0
+        for x in xs
+            n += Self.present_size(number, x)
+        n
+
+    packed_size(number: u32, xs: []const Self::Value) -> usize
+        if xs.len == 0 then return 0
+        val body = Self.run_size(xs)
+        varint_size(tag_of(number, Len)) + varint_size(u64(body)) + body
+
+    /** The elements of a packed run, without its tag and length. */
+    run_size(xs: []const Self::Value) -> usize
+        var n: usize = 0
+        for x in xs
+            n += Self.size(x)
+        n
+
+    /** A field's value, after checking it arrived with the wire type this codec has. */
+    read(r: *Reader, f: Field) -> Result[Self::Value, DecodeError]
+        if f.wire != Self.wire then return Err(WrongWireType(f.at, f.number, f.wire))
+        Self.get(r)
+
+    /** One occurrence of a repeated field, appended to `into`. A number may arrive packed — every
+     * element in one length-delimited run — or one tag per element, and a reader must take both
+     * whichever the schema asked for. */
+    read_repeated(r: *Reader, f: Field, into: Buf[Self::Value]) -> Result[unit, DecodeError]
+        if f.wire == Len && Self.wire != Len then
+            var run = r.delimited()?
+            while run.more()
+                into.push(Self.get(&run)?)
+            return Ok(())
+        into.push(Self.read(r, f)?)
+        Ok(())
+end Codec
+
+/** A generated message. `empty` is the message with every field at its default, which is also what
+ * an empty input decodes to; `merge` reads fields into it until its reader ends. */
+trait Message
+    empty() -> Self
+    encoded_size(self) -> usize
+    encode[O: Output](self, out: *O) -> Result[unit, EncodeError]
+    merge(*self, r: *Reader) -> Result[unit, DecodeError]
+
+    /** A whole encoded message, read. */
+    decode(bytes: []const u8) -> Result[Self, DecodeError]
+        var m = Self.empty()
+        var r = reader(bytes)
+        m.merge(&r)?
+        Ok(m)
+
+    /** The message encoded into a new buffer. */
+    to_bytes(self) -> Buf[u8]
+        var out = buf_output()
+        // A growing output never answers `Full`, so there is no error to hand on.
+        self.encode(&out).unwrap()
+        out.bytes
+end Message
+
+/** A generated enum. proto3 enums are open — a value the schema does not name still has to arrive
+ * and leave unchanged — so each generated enum carries an `Unrecognized(value)` variant beside the
+ * named ones, and these two convert in both directions without losing anything. */
+trait ProtoEnum
+    value -> i32
+    from_value(v: i32) -> Self
+
+/** A singular message field read again: the format says a sub-message that appears twice is merged
+ * into the first, field by field, rather than replacing it. */
+merge_message[M: Message](r: *Reader, f: Field, into: Option[M]) -> Result[M, DecodeError]
+    if f.wire != Len then return Err(WrongWireType(f.at, f.number, f.wire))
+    var sub = r.delimited()?
+    var m = into.unwrap_or_else(() -> M.empty())
+    m.merge(&sub)?
+    Ok(m)
+
+/** A message field, nested as a length-delimited run of its own encoding. A generated file names one
+ * per message type with an alias — `type AddressCodec = MessageOf[Address]` — and its fields are
+ * written through that. */
+struct MessageOf[M: Message]
+end MessageOf
+
+impl[M: Message] Codec for MessageOf[M]
+    type Value = M
+    static wire -> WireType = Len
+    // A sub-message's presence is its `Option`, so one that is there is written even when empty.
+    is_default(v: M) -> bool = false
+    size(v: M) -> usize
+        val n = v.encoded_size()
+        varint_size(u64(n)) + n
+    put[O: Output](out: *O, v: M) -> Result[unit, EncodeError]
+        out.varint(u64(v.encoded_size()))?
+        v.encode(out)
+    get(r: *Reader) -> Result[M, DecodeError]
+        var sub = r.delimited()?
+        var m = M.empty()
+        m.merge(&sub)?
+        Ok(m)
+
+/** An enum field, carried as an `int32`. Named per enum type with an alias, as a message's is. */
+struct EnumOf[E: ProtoEnum]
+end EnumOf
+
+impl[E: ProtoEnum] Codec for EnumOf[E]
+    type Value = E
+    static wire -> WireType = Varint
+    is_default(v: E) -> bool = v.value == 0
+    size(v: E) -> usize = varint_size(u64(i64(v.value)))
+    put[O: Output](out: *O, v: E) -> Result[unit, EncodeError] = out.varint(u64(i64(v.value)))
+    get(r: *Reader) -> Result[E, DecodeError] = Ok(E.from_value(i32(r.varint()?)))
+
+// -- the varint types -----------------------------------------------------------------------------
+
+struct Int32
+end Int32
+
+impl Codec for Int32
+    type Value = i32
+    static wire -> WireType = Varint
+    is_default(v: i32) -> bool = v == 0
+    // A negative int32 is sign-extended to 64 bits first, so it always takes ten bytes.
+    size(v: i32) -> usize = varint_size(u64(i64(v)))
+    put[O: Output](out: *O, v: i32) -> Result[unit, EncodeError] = out.varint(u64(i64(v)))
+    get(r: *Reader) -> Result[i32, DecodeError] = Ok(i32(r.varint()?))
+
+struct Int64
+end Int64
+
+impl Codec for Int64
+    type Value = i64
+    static wire -> WireType = Varint
+    is_default(v: i64) -> bool = v == 0
+    size(v: i64) -> usize = varint_size(u64(v))
+    put[O: Output](out: *O, v: i64) -> Result[unit, EncodeError] = out.varint(u64(v))
+    get(r: *Reader) -> Result[i64, DecodeError] = Ok(i64(r.varint()?))
+
+struct UInt32
+end UInt32
+
+impl Codec for UInt32
+    type Value = u32
+    static wire -> WireType = Varint
+    is_default(v: u32) -> bool = v == 0
+    size(v: u32) -> usize = varint_size(u64(v))
+    put[O: Output](out: *O, v: u32) -> Result[unit, EncodeError] = out.varint(u64(v))
+    get(r: *Reader) -> Result[u32, DecodeError] = Ok(u32(r.varint()?))
+
+struct UInt64
+end UInt64
+
+impl Codec for UInt64
+    type Value = u64
+    static wire -> WireType = Varint
+    is_default(v: u64) -> bool = v == 0
+    size(v: u64) -> usize = varint_size(v)
+    put[O: Output](out: *O, v: u64) -> Result[unit, EncodeError] = out.varint(v)
+    get(r: *Reader) -> Result[u64, DecodeError] = r.varint()
+
+struct SInt32
+end SInt32
+
+impl Codec for SInt32
+    type Value = i32
+    static wire -> WireType = Varint
+    is_default(v: i32) -> bool = v == 0
+    size(v: i32) -> usize = varint_size(u64(zigzag32(v)))
+    put[O: Output](out: *O, v: i32) -> Result[unit, EncodeError] = out.varint(u64(zigzag32(v)))
+    get(r: *Reader) -> Result[i32, DecodeError] = Ok(unzigzag32(u32(r.varint()?)))
+
+struct SInt64
+end SInt64
+
+impl Codec for SInt64
+    type Value = i64
+    static wire -> WireType = Varint
+    is_default(v: i64) -> bool = v == 0
+    size(v: i64) -> usize = varint_size(zigzag64(v))
+    put[O: Output](out: *O, v: i64) -> Result[unit, EncodeError] = out.varint(zigzag64(v))
+    get(r: *Reader) -> Result[i64, DecodeError] = Ok(unzigzag64(r.varint()?))
+
+struct Bool
+end Bool
+
+impl Codec for Bool
+    type Value = bool
+    static wire -> WireType = Varint
+    is_default(v: bool) -> bool = !v
+    size(v: bool) -> usize = 1
+    put[O: Output](out: *O, v: bool) -> Result[unit, EncodeError] = out.put_byte(if v then 1 else 0)
+    get(r: *Reader) -> Result[bool, DecodeError] = Ok(r.varint()? != 0)
+
+// -- the fixed-width types ------------------------------------------------------------------------
+
+struct Fixed32
+end Fixed32
+
+impl Codec for Fixed32
+    type Value = u32
+    static wire -> WireType = I32
+    is_default(v: u32) -> bool = v == 0
+    size(v: u32) -> usize = 4
+    put[O: Output](out: *O, v: u32) -> Result[unit, EncodeError] = out.fixed32(v)
+    get(r: *Reader) -> Result[u32, DecodeError] = r.fixed32()
+
+struct SFixed32
+end SFixed32
+
+impl Codec for SFixed32
+    type Value = i32
+    static wire -> WireType = I32
+    is_default(v: i32) -> bool = v == 0
+    size(v: i32) -> usize = 4
+    put[O: Output](out: *O, v: i32) -> Result[unit, EncodeError] = out.fixed32(u32(v))
+    get(r: *Reader) -> Result[i32, DecodeError] = Ok(i32(r.fixed32()?))
+
+struct Float
+end Float
+
+// A float is default only when its bits are all zero: -0.0 is written, as protobuf's own encoders
+// write it.
+impl Codec for Float
+    type Value = f32
+    static wire -> WireType = I32
+    is_default(v: f32) -> bool = v.bits() == 0
+    size(v: f32) -> usize = 4
+    put[O: Output](out: *O, v: f32) -> Result[unit, EncodeError] = out.fixed32(v.bits())
+    get(r: *Reader) -> Result[f32, DecodeError] = Ok(f32.from_bits(r.fixed32()?))
+
+struct Fixed64
+end Fixed64
+
+impl Codec for Fixed64
+    type Value = u64
+    static wire -> WireType = I64
+    is_default(v: u64) -> bool = v == 0
+    size(v: u64) -> usize = 8
+    put[O: Output](out: *O, v: u64) -> Result[unit, EncodeError] = out.fixed64(v)
+    get(r: *Reader) -> Result[u64, DecodeError] = r.fixed64()
+
+struct SFixed64
+end SFixed64
+
+impl Codec for SFixed64
+    type Value = i64
+    static wire -> WireType = I64
+    is_default(v: i64) -> bool = v == 0
+    size(v: i64) -> usize = 8
+    put[O: Output](out: *O, v: i64) -> Result[unit, EncodeError] = out.fixed64(u64(v))
+    get(r: *Reader) -> Result[i64, DecodeError] = Ok(i64(r.fixed64()?))
+
+struct Double
+end Double
+
+impl Codec for Double
+    type Value = real
+    static wire -> WireType = I64
+    is_default(v: real) -> bool = v.bits() == 0
+    size(v: real) -> usize = 8
+    put[O: Output](out: *O, v: real) -> Result[unit, EncodeError] = out.fixed64(v.bits())
+    get(r: *Reader) -> Result[real, DecodeError] = Ok(real.from_bits(r.fixed64()?))
+
+// -- the length-delimited types -------------------------------------------------------------------
+
+/** A `string` field. Reading one checks the bytes are UTF-8 and copies them out. */
+struct Str
+end Str
+
+impl Codec for Str
+    type Value = string
+    static wire -> WireType = Len
+    is_default(v: string) -> bool = v.len == 0
+    size(v: string) -> usize = varint_size(u64(v.len)) + v.len
+    put[O: Output](out: *O, v: string) -> Result[unit, EncodeError]
+        out.varint(u64(v.len))?
+        out.put(v.bytes)
+    get(r: *Reader) -> Result[string, DecodeError]
+        val at = r.at
+        from_utf8(r.chunk()?).map_err(_ -> BadUtf8(at))
+
+/** A `bytes` field, held as a `Buf[u8]` of its own. */
+struct Bytes
+end Bytes
+
+impl Codec for Bytes
+    type Value = Buf[u8]
+    static wire -> WireType = Len
+    is_default(v: Buf[u8]) -> bool = v.len() == 0
+    size(v: Buf[u8]) -> usize = varint_size(u64(v.len())) + v.len()
+    put[O: Output](out: *O, v: Buf[u8]) -> Result[unit, EncodeError]
+        out.varint(u64(v.len()))?
+        out.put(v.view())
+    get(r: *Reader) -> Result[Buf[u8], DecodeError]
+        val b: Buf[u8] = buf()
+        b.extend(r.chunk()?)
+        Ok(b)

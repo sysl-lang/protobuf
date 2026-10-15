@@ -1,0 +1,129 @@
+module sh.sysl.protobuf.gen
+@tests
+@requires(heap, os)
+
+import sh.sysl.protobuf.schema.{EnumDecl, EnumValue, Schema, load_with}
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, split}
+
+// The generator's own rules: names, what it refuses, and the command line around it. What the code
+// it writes does is the oracle tests' business.
+
+private schema_of(text: string) -> Schema =
+    load_with(["a.proto"], name -> if name == "a.proto" then Some(text) else None).unwrap()
+
+private generated(text: string) -> string = generate(schema_of(text), "a.proto").unwrap().text
+
+private refused(text: string, want: string)
+    generate(schema_of(text), "a.proto") match
+        Ok(_) -> panic(f"expected '$want', and the file generated")
+        Err(e) -> if !e.contains(want) then panic(f"expected '$want', and got:\n$e")
+
+private enum_of(name: string, values: []const string) -> EnumDecl
+    val vs: Buf[EnumValue] = buf()
+    var n = 0
+    for v in values
+        vs.push(EnumValue(v, n, buf(), sh.sysl.parsing.point(0)))
+        n += 1
+    EnumDecl(name, "", vs, buf(), buf(), buf(), sh.sysl.parsing.point(0))
+
+@test("enum values lose the enum's own prefix where every value has it, and are camel-cased")
+variants()
+    assert_eq(variant_names(enum_of("PhoneType", ["PHONE_TYPE_UNSPECIFIED", "PHONE_TYPE_HOME_ADDRESS"])).view(),
+              ["Unspecified", "HomeAddress"][..])
+    // One value without the prefix keeps them all whole.
+    assert_eq(variant_names(enum_of("Kind", ["KIND_A", "OTHER"])).view(), ["KindA", "Other"][..])
+    // A value that would start with a digit keeps the prefix.
+    assert_eq(variant_names(enum_of("Version", ["VERSION_UNKNOWN", "VERSION_2"])).view(), ["VersionUnknown", "Version2"][..])
+    // A value that is only the prefix keeps it.
+    assert_eq(variant_names(enum_of("Mode", ["MODE_", "MODE_X"])).view(), ["Mode", "ModeX"][..])
+    assert_eq(camel("HTTP_ERROR_404"), "HttpError404")
+    assert_eq(screaming("HTTPStatus"), "HTTPSTATUS")
+    assert_eq(screaming("PhoneType2"), "PHONE_TYPE2")
+
+@test("field names: reserved words are quoted and the members every message has get an underscore")
+field_names()
+    assert_eq(field_name("name"), "name")
+    assert_eq(field_name("type"), "`type`")
+    assert_eq(field_name("match"), "`match`")
+    assert_eq(field_name("decode"), "decode_")
+    assert_eq(field_name("to_bytes"), "to_bytes_")
+
+@test("a nested type is named by joining, and two that would join to one name are refused")
+nested_names()
+    val text = generated("""
+        syntax = "proto3";
+        package p;
+        message Outer { message Inner { int32 a = 1; } Inner inner = 1; enum Mode { MODE_OFF = 0; } Mode mode = 2; }
+        """)
+    assert(text.contains("struct OuterInner derives Eq, Display"))
+    assert(text.contains("enum OuterMode derives Eq, Display"))
+    assert(text.contains("    inner: Option[OuterInner]"))
+    assert(text.contains("    mode: OuterMode"))
+    assert(text.contains("type OuterInnerCodec = MessageOf[OuterInner]"))
+    refused("syntax = \"proto3\"; package p; message A { message B {} } message AB {}", "would both be called `AB`")
+
+@test("a oneof's members not next to each other in number order are written where their numbers fall")
+split_oneof()
+    val text = generated("""
+        syntax = "proto3";
+        package p;
+        message M { oneof o { int32 a = 1; string c = 3; } int32 b = 2; }
+        """)
+    val encode_at = text.index_of("encode[O").unwrap()
+    val first = text.index_of_from("Some(MO.A(v)) -> Int32.present(out, 1, v)?", encode_at).unwrap()
+    val middle = text.index_of_from("Int32.field(out, 2, self.b)?", encode_at).unwrap()
+    val last = text.index_of_from("Some(MO.C(v)) -> Str.present(out, 3, v)?", encode_at).unwrap()
+    assert(first < middle && middle < last)
+    assert(text.contains("            _ -> ()"))
+
+@test("a oneof whose enum name is taken by a nested message gets `Oneof` after it")
+oneof_name_taken()
+    val text = generated("""
+        syntax = "proto3";
+        package p;
+        message M { message Pick { int32 x = 1; } oneof pick { Pick p = 1; int32 n = 2; } }
+        """)
+    assert(text.contains("enum MPickOneof derives Eq, Display"))
+    assert(text.contains("    pick: Option[MPickOneof]"))
+
+@test("what the generator refuses: no package, a package sysl cannot name, recursion, and a name the code uses")
+refusals()
+    refused("syntax = \"proto3\"; message M {}", "has no `package`")
+    refused("syntax = \"proto3\"; package a.type.b; message M {}", "`type` in it, which is a reserved word")
+    refused("syntax = \"proto3\"; package p; message M { M next = 1; }", "`p.M` contains itself by value")
+    refused("syntax = \"proto3\"; package p; message A { B b = 1; } message B { oneof o { A a = 1; } }", "contains itself by value")
+    refused("syntax = \"proto3\"; package p; message Reader { int32 a = 1; }", "which the generated code also uses")
+    // Recursion through a repeated field is fine.
+    assert(generated("syntax = \"proto3\"; package p; message Tree { repeated Tree kids = 1; }").contains("kids: Buf[Tree]"))
+
+@test("the generated text is tidy: no tabs, no trailing spaces, one newline at the end")
+tidy_output()
+    val text = generated("""
+        syntax = "proto3";
+        package p;
+        message M { int32 a = 1; map<string, M> m = 2; oneof o { bool b = 3; } }
+        enum E { E_ZERO = 0; }
+        message Empty {}
+        """)
+    assert(text.ends_with("\n") && !text.ends_with("\n\n"))
+    for line in split(text, "\n")
+        assert(!line.ends_with(" "), f"trailing space: '$line'")
+        assert(!line.contains("\t"))
+    assert(text.contains("struct Empty derives Eq, Display\nend Empty"))
+    assert(text.contains("import sysl.buf.{Buf, buf}"))
+
+@test("the command line: usage, its mistakes with status 2, a schema's with status 1")
+command_line()
+    assert_eq(run_cli(["--help"]).status, 0)
+    assert(run_cli(["--help"]).text.starts_with("usage: protoc-sysl"))
+    val none = run_cli([])
+    assert_eq(none.status, 2)
+    assert(none.text.contains("no .proto files given"))
+    assert_eq(run_cli(["x.proto"]).status, 2)
+    assert(run_cli(["x.proto"]).text.contains("`--out <dir>` is required"))
+    assert(run_cli(["--frobnicate", "x.proto"]).text.contains("`--frobnicate` is not an option"))
+    assert(run_cli(["--out"]).text.contains("`--out` needs a directory"))
+    val missing = run_cli(["-I", "testdata", "--out", "/tmp", "nope.proto"])
+    assert_eq(missing.status, 1)
+    assert(missing.text.contains("not under any include directory"), missing.text)

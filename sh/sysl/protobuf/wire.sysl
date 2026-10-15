@@ -1,0 +1,111 @@
+module sh.sysl.protobuf
+
+// The wire format's vocabulary: the six wire types, the tag that pairs one with a field number, the
+// two integer transforms (base-128 varints and zigzag), and the errors either direction can answer.
+//
+// Nothing in this module allocates on the encoding side or in the reader itself, so the same source
+// writes a message into a caller's buffer on a board with no heap. What does allocate is named where
+// it is declared: the growing `BufOutput`, and decoding a `string`, a `bytes` or a repeated field,
+// which have to put what they read somewhere.
+
+/** How a field's value is laid out after its tag (the low three bits of the tag).
+ *
+ * `SGroup` and `EGroup` are proto2's groups. Nothing here writes one, but a reader still has to step
+ * over one it does not know, so they are named rather than refused.
+ */
+enum WireType: u8 derives Display
+    Varint = 0
+    I64 = 1
+    Len = 2
+    SGroup = 3
+    EGroup = 4
+    I32 = 5
+
+/** The wire type a tag's low three bits name, or `None` for 6 and 7, which no encoder writes. */
+wire_type_of(bits: u64) -> Option[WireType]
+    (bits & 7) match
+        0 -> Some(Varint)
+        1 -> Some(I64)
+        2 -> Some(Len)
+        3 -> Some(SGroup)
+        4 -> Some(EGroup)
+        5 -> Some(I32)
+        _ -> None
+
+/** The largest field number the format allows, 2^29 - 1. */
+const max_field: u32 = 536_870_911
+
+/** A tag: the field number shifted past the three bits that hold the wire type. */
+tag_of(number: u32, wire: WireType) -> u64 = u64(number) << 3 | u64(u8(wire))
+
+/** How many bytes `v` takes as a varint: one per seven bits, and at least one. */
+varint_size(v: u64) -> usize
+    var n: usize = 1
+    var x = v
+    while x >= 0x80
+        x >>= 7
+        n += 1
+    n
+
+/** Zigzag maps a signed value to an unsigned one with the small magnitudes small: 0, -1, 1, -2 are
+ * 0, 1, 2, 3. It is what `sint32` and `sint64` put through a varint, since a negative `int32` is
+ * sign-extended to ten bytes. */
+zigzag32(v: i32) -> u32 = u32((v << 1) ^ (v >> 31))
+
+zigzag64(v: i64) -> u64 = u64((v << 1) ^ (v >> 63))
+
+unzigzag32(u: u32) -> i32 = i32(u >> 1) ^ -i32(u & 1)
+
+unzigzag64(u: u64) -> i64 = i64(u >> 1) ^ -i64(u & 1)
+
+/** Why an encoding stopped.
+ *
+ * There is one way for it to fail: the output was a fixed buffer, and it is full. `at` is the offset
+ * of the first byte that did not fit, so a caller sizing its buffer can see how far it got — though
+ * `encoded_size()` answers that question before anything is written.
+ */
+enum EncodeError derives Eq, Display
+    Full(at: usize)
+
+/** Why a decoding stopped. Every variant carries `at`, the byte offset into the whole input of the
+ * thing that was wrong — the tag, the length, the varint — rather than into a nested message.
+ */
+enum DecodeError derives Eq
+    // The input ended in the middle of a tag or a value.
+    Truncated(at: usize)
+    // A varint ran past ten bytes, or its tenth byte carried more than the one bit 64 leaves.
+    Overlong(at: usize)
+    // A length prefix runs past the end of the message holding it.
+    BadLength(at: usize)
+    // A tag naming field 0, or a number past `max_field`, which no field can have.
+    BadFieldNumber(at: usize)
+    // A tag whose wire type is 6 or 7.
+    BadWireType(at: usize, wire: u8)
+    // A known field arrived with a wire type its type cannot have.
+    WrongWireType(at: usize, field: u32, wire: WireType)
+    // A group's end tag with no start, or with another field's number.
+    BadGroup(at: usize)
+    // A `string` field whose bytes are not UTF-8.
+    BadUtf8(at: usize)
+    // Messages nested past `max_depth`.
+    TooDeep(at: usize)
+end DecodeError
+
+impl Display for DecodeError
+    display(self, out: *Writer, fmt: FormatSpec)
+        val text = self match
+            Truncated(at) -> f"the input ends inside a value at byte $at"
+            Overlong(at) -> f"a varint at byte $at is longer than ten bytes"
+            BadLength(at) -> f"the length at byte $at runs past the end of its message"
+            BadFieldNumber(at) -> f"the tag at byte $at names field 0 or one past 2^29 - 1"
+            BadWireType(at, wire) -> f"the tag at byte $at has wire type $wire, which does not exist"
+            WrongWireType(at, field, wire) -> f"field $field at byte $at arrived as wire type ${u8(wire)}, which its type cannot have"
+            BadGroup(at) -> f"the group end at byte $at closes nothing"
+            BadUtf8(at) -> f"the string at byte $at is not UTF-8"
+            TooDeep(at) -> f"the message at byte $at is nested more than $max_depth deep"
+        display_str(text, out, fmt)
+    end display
+
+/** How deep messages may nest before a reader refuses: a recursive descent has the stack for a
+ * limit, and hostile input is one byte per level. 100 is the limit protobuf's own parsers keep. */
+const max_depth: usize = 100

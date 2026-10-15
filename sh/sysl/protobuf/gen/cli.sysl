@@ -1,0 +1,90 @@
+module sh.sysl.protobuf.gen
+
+import sh.sysl.protobuf.schema.load
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, read_text, write_text}
+import sysl.text.Search
+
+/** What `protoc-sysl` prints when it is asked how to use it, or used wrongly. */
+const usage: string = """
+    usage: protoc-sysl [-I <dir>]... --out <dir> <file.proto>...
+
+    Reads each .proto file, with its imports found under the -I directories (the current
+    directory when none is given), and writes the sysl for it under --out: one module per
+    package, so `package demo.v1;` in person.proto becomes <out>/demo/v1/person.sysl.
+
+      -I, --proto_path <dir>   a directory imports are found under; may be repeated
+      --out <dir>              where the generated files go
+      --check                  write nothing; fail if any file under --out differs from what
+                               would be generated
+      -h, --help               this text
+    """
+
+/** The outcome of a command line: what to print, and the status to exit with. */
+struct Outcome derives Eq, Display
+    text: string
+    status: int
+
+/** `protoc-sysl`'s whole behaviour, given its arguments (without the program's name). It answers
+ * rather than printing and exiting, so that it can be tested: 0 for success, 1 for a schema that
+ * would not read or resolve, 2 for a command line that would not parse. */
+@needs(os)
+run_cli(args: []const string) -> Outcome
+    val include: Buf[string] = buf()
+    val roots: Buf[string] = buf()
+    var out = ""
+    var check = false
+    var i: usize = 0
+    while i < args.len
+        val a = args[i]
+        if a == "-h" || a == "--help" then return Outcome(usage, 0)
+        if a == "-I" || a == "--proto_path" || a == "--out" then
+            if i + 1 >= args.len then return Outcome(s"protoc-sysl: `$a` needs a directory after it\n\n$usage", 2)
+            if a == "--out" then out = args[i + 1] else include.push(args[i + 1])
+            i += 2
+            continue
+        if a.starts_with("-I") && a.len > 2 then
+            include.push(a[2..<a.len])
+        elif a.starts_with("--out=") then
+            out = a[6..<a.len]
+        elif a == "--check" then
+            check = true
+        elif a.starts_with("-") then
+            return Outcome(s"protoc-sysl: `$a` is not an option\n\n$usage", 2)
+        else
+            roots.push(a)
+        i += 1
+    if roots.is_empty() then return Outcome(s"protoc-sysl: no .proto files given\n\n$usage", 2)
+    if out == "" then return Outcome(s"protoc-sysl: `--out <dir>` is required\n\n$usage", 2)
+    val schema = load(roots.view(), include.view()) match
+        Ok(s) -> s
+        Err(e) -> return Outcome(e, 1)
+    // The roots by import name: the files the schema read last for each root are the roots
+    // themselves, since a root comes after everything it imports.
+    val names: Buf[string] = buf()
+    for root in roots
+        for f in schema.files
+            if root.ends_with(f.name) && !has(names, f.name) then
+                names.push(f.name)
+                break
+    val files = generate_all(schema, names.view()) match
+        Ok(fs) -> fs
+        Err(e) -> return Outcome(e, 1)
+    val said: Buf[string] = buf()
+    var stale = false
+    for f in files
+        val path = out + "/" + f.path
+        if check then
+            if read_text(path).ok() != Some(f.text) then
+                said.push(s"$path is not what ${f.module_name} generates")
+                stale = true
+        else
+            val dir = path[0..<path.last_index_of("/").unwrap()]
+            make_dir_all(dir).map_err(e -> s"protoc-sysl: cannot make $dir: $e") match
+                Ok(_) -> ()
+                Err(e) -> return Outcome(e, 1)
+            write_text(path, f.text) match
+                Ok(_) -> said.push(s"wrote $path")
+                Err(e) -> return Outcome(s"protoc-sysl: cannot write $path: $e", 1)
+    Outcome(sysl.text.join(said.view(), "\n"), if stale then 1 else 0)
+end run_cli

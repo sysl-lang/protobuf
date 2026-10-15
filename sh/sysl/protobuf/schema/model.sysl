@@ -1,0 +1,218 @@
+module sh.sysl.protobuf.schema
+
+import sh.sysl.parsing.{Source, Span}
+import sysl.buf.{Buf, buf}
+
+// What a `.proto` file says, as read: every declaration with the span it was written at, so that a
+// later pass — resolution, or a generator refusing something — can point at the place.
+//
+// **The shape follows protobuf's own descriptors** (descriptor.proto), and where a `.proto` file is
+// shorthand for something a descriptor spells out, the shorthand is expanded here as protoc expands
+// it. A `map<K, V>` field becomes a repeated field of a nested `…Entry` message with `key = 1` and
+// `value = 2` — which is what goes on the wire — and the field remembers it was a map. That makes the
+// model comparable fact for fact with protoc's own parse, which is how it is tested.
+
+/** The fifteen scalar types. */
+enum Scalar derives Display
+    Double
+    Float
+    Int64
+    UInt64
+    Int32
+    Fixed64
+    Fixed32
+    Bool
+    Str
+    Bytes
+    UInt32
+    SFixed32
+    SFixed64
+    SInt32
+    SInt64
+
+    /** The keyword a `.proto` file spells it with. */
+    keyword(self) -> string = self match
+        Double -> "double"
+        Float -> "float"
+        Int64 -> "int64"
+        UInt64 -> "uint64"
+        Int32 -> "int32"
+        Fixed64 -> "fixed64"
+        Fixed32 -> "fixed32"
+        Bool -> "bool"
+        Str -> "string"
+        Bytes -> "bytes"
+        UInt32 -> "uint32"
+        SFixed32 -> "sfixed32"
+        SFixed64 -> "sfixed64"
+        SInt32 -> "sint32"
+        SInt64 -> "sint64"
+
+    /** Whether a repeated field of it is packed by default: every type but the two length-delimited
+     * ones. */
+    packable(self) -> bool = self != Str && self != Bytes
+
+    /** Whether it may be a map's key: any integral type, `bool` or `string`. */
+    keyable(self) -> bool = self != Double && self != Float && self != Bytes
+end Scalar
+
+/** The scalar a keyword names, if it names one. */
+scalar_named(word: string) -> Option[Scalar]
+    for s in [Scalar.Double, Scalar.Float, Scalar.Int64, Scalar.UInt64, Scalar.Int32, Scalar.Fixed64,
+              Scalar.Fixed32, Scalar.Bool, Scalar.Str, Scalar.Bytes, Scalar.UInt32, Scalar.SFixed32,
+              Scalar.SFixed64, Scalar.SInt32, Scalar.SInt64]
+        if s.keyword() == word then return Some(s)
+    None
+
+/** What a named type turned out to be, once resolved. */
+enum Kind derives Display
+    Unresolved
+    Message
+    Enum
+
+/** A field's type: a scalar, or a name to be resolved against the scopes it was written in.
+ *
+ * `written` is the name as the file spelled it; `full` is the fully qualified name resolution found,
+ * with the leading dot protoc writes (`.pkg.Outer.Inner`), and empty until then.
+ */
+enum TypeRef derives Eq, Display
+    ScalarType(s: Scalar)
+    Named(written: string, full: string, kind: Kind)
+
+/** A field's label. `Implicit` is a proto3 field with no label: present when not the default. */
+enum Label derives Display
+    Implicit
+    Optional
+    Repeated
+
+/** A value an option was given, kept as written. */
+enum Constant derives Eq, Display
+    Ident(name: string)
+    Int(magnitude: ulong, negative: bool)
+    Float(text: string)
+    Text(value: string)
+    Aggregate(text: string)
+
+/** `name = value`, for a file, message, field, enum, value or oneof. The name is as written,
+ * parentheses and all: `deprecated`, `(my.ext).part`. */
+struct OptionDecl derives Eq, Display
+    name: string
+    value: Constant
+    span: Span
+
+struct FieldDecl derives Eq, Display
+    name: string
+    number: u32
+    label: Label
+    ty: TypeRef
+    // Which of the message's oneofs holds it, by index.
+    oneof: Option[usize]
+    // The camel-case name JSON uses: `json_name` when given, protoc's derivation otherwise.
+    json_name: string
+    // Whether it was written as a `map<K, V>`; `ty` is then the entry message.
+    is_map: bool
+    options: Buf[OptionDecl]
+    span: Span
+
+    /** Whether a repeated field goes on the wire packed: a packable scalar or enum, unless its
+     * `packed` option says `false`. */
+    packed(self) -> bool
+        if self.label != Repeated then return false
+        for o in self.options
+            if o.name == "packed" then return o.value != Ident("false")
+        self.ty match
+            ScalarType(s) -> s.packable()
+            Named(_, _, kind) -> kind == Enum
+end FieldDecl
+
+struct OneofDecl derives Eq, Display
+    name: string
+    options: Buf[OptionDecl]
+    span: Span
+
+/** A reserved range of field or value numbers, `start` to `end` inclusive. */
+struct Range derives Eq, Display
+    start: long
+    end: long
+    span: Span
+
+struct MessageDecl derives Eq, Display
+    name: string
+    // `.pkg.Outer.Name`, filled in when the file is read.
+    full: string
+    fields: Buf[FieldDecl]
+    oneofs: Buf[OneofDecl]
+    messages: Buf[MessageDecl]
+    enums: Buf[EnumDecl]
+    reserved: Buf[Range]
+    reserved_names: Buf[string]
+    options: Buf[OptionDecl]
+    // A map field's synthesized entry.
+    map_entry: bool
+    span: Span
+
+struct EnumValue derives Eq, Display
+    name: string
+    number: i32
+    options: Buf[OptionDecl]
+    span: Span
+
+struct EnumDecl derives Eq, Display
+    name: string
+    full: string
+    values: Buf[EnumValue]
+    reserved: Buf[Range]
+    reserved_names: Buf[string]
+    options: Buf[OptionDecl]
+    span: Span
+
+    /** Whether `allow_alias = true` lets two names share a number. */
+    allows_alias(self) -> bool
+        for o in self.options
+            if o.name == "allow_alias" then return o.value == Ident("true")
+        false
+
+struct Import derives Eq, Display
+    path: string
+    public: bool
+    is_weak: bool
+    span: Span
+
+struct ServiceDecl derives Eq, Display
+    name: string
+    span: Span
+
+/** One `.proto` file as read.
+ *
+ * `name` is its path as an import names it — relative to the search directory it was found under,
+ * with `/` between the parts — which is also the name protoc gives it. `src` is kept so that every
+ * span in the file can still be drawn.
+ */
+struct ProtoFile
+    name: string
+    src: Source
+    package: string
+    imports: Buf[Import]
+    messages: Buf[MessageDecl]
+    enums: Buf[EnumDecl]
+    services: Buf[ServiceDecl]
+    options: Buf[OptionDecl]
+
+/** protoc's JSON name for a field: underscores dropped and the letter after each one capitalised,
+ * the first letter left as it is. */
+json_name_of(name: string) -> string
+    val out: Buf[u8] = buf()
+    var upper = false
+    for c in name.bytes
+        if c == u8('_') then
+            upper = true
+        elif upper && c >= u8('a') && c <= u8('z') then
+            out.push(c - 32)
+            upper = false
+        else
+            out.push(c)
+            upper = false
+    from_bytes(out)
+
+// A string of bytes known to be text, since they were copied out of one.
+private[schema] from_bytes(b: Buf[u8]) -> string = sysl.text.from_utf8_unchecked(b.view())

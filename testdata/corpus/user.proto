@@ -1,0 +1,24 @@
+// Reaches base.proto only through relay.proto's public import, and has a message with nothing in it.
+syntax = "proto3";
+
+package corpus.user;
+
+import "corpus/relay.proto";
+
+message User {
+  string name = 1;
+  corpus.base.Shared shared = 2;
+  corpus.relay.Relay relay = 3;
+  Empty nothing = 4;
+  map<string, corpus.base.Status> statuses = 5;
+  Tree tree = 6;
+}
+
+message Empty {}
+
+// Recursive, through a repeated field and through a map's values.
+message Tree {
+  string name = 1;
+  repeated Tree kids = 2;
+  map<string, Tree> named = 3;
+}

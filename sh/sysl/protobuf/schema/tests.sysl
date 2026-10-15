@@ -1,0 +1,273 @@
+module sh.sysl.protobuf.schema
+@tests
+@requires(heap, os)
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The reader and the resolver on files held in memory. protoc's own parse of a corpus on disk is the
+// other half (`oracle_tests.sysl` in `gen`).
+
+// A table of files by import name.
+private files(pairs: []const (string, string)) -> &Fn(string) -> Option[string] =
+    name ->
+        var found: Option[string] = None
+        for (n, text) in pairs
+            if n == name then found = Some(text)
+        found
+
+private one(text: string) -> Result[Schema, string] = load_with(["a.proto"], files([("a.proto", text)]))
+
+private ok(text: string) -> Schema = one(text) match
+    Ok(s) -> s
+    Err(e) -> panic(f"expected the file to resolve, and it said:\n$e")
+
+private refused(text: string, want: string)
+    one(text) match
+        Ok(_) -> panic(f"expected '$want', and the file resolved")
+        Err(e) -> if !e.contains(want) then panic(f"expected '$want', and got:\n$e")
+
+private field_named(m: MessageDecl, name: string) -> FieldDecl
+    for f in m.fields
+        if f.name == name then return f
+    panic(f"no field $name in ${m.name}")
+
+@test("a message with scalars, a repeated field, an enum and a nested message reads into the model")
+reads_a_message()
+    val s = ok("""
+        syntax = "proto3";
+        package demo.v1;
+        // A person.
+        message Person {
+          string name = 1;
+          int32 id = 2 [deprecated = true];
+          repeated sint64 scores = 3;
+          /* nested */ message Phone { string number = 1; Kind kind = 2; }
+          enum Kind { KIND_UNSPECIFIED = 0; MOBILE = 1; }
+          optional bool active = 4;
+          repeated Phone phones = 5;
+          repeated string tags = 6 [packed = false];
+          repeated Kind kinds = 7 [packed = false];
+        }
+        """)
+    val f = s.files[0]
+    assert_eq(f.package, "demo.v1")
+    val p = f.messages[0]
+    assert_eq(p.full, ".demo.v1.Person")
+    assert_eq(p.fields.len(), 7)
+    assert_eq(field_named(p, "id").options[0].name, "deprecated")
+    assert_eq(field_named(p, "scores").label, Repeated)
+    assert(field_named(p, "scores").packed())
+    assert(!field_named(p, "tags").packed())
+    assert(!field_named(p, "kinds").packed())
+    assert_eq(field_named(p, "active").label, Optional)
+    assert_eq(field_named(p, "phones").ty, Named("Phone", ".demo.v1.Person.Phone", Message))
+    assert_eq(p.messages[0].fields[1].ty, Named("Kind", ".demo.v1.Person.Kind", Enum))
+    assert_eq(s.enum_named(".demo.v1.Person.Kind").unwrap().values[1].name, "MOBILE")
+
+@test("a map is a repeated field of a nested entry message, named as protoc names it")
+maps()
+    val s = ok("""
+        syntax = "proto3";
+        message M { map<string, int32> word_counts = 1; map<int64, M> kids = 2; }
+        """)
+    val m = s.files[0].messages[0]
+    assert_eq(m.messages[0].name, "WordCountsEntry")
+    assert(m.messages[0].map_entry)
+    assert_eq(m.messages[0].fields[0].ty, ScalarType(Scalar.Str))
+    assert_eq(m.messages[1].fields[1].ty, Named("M", ".M", Message))
+    val wc = field_named(m, "word_counts")
+    assert(wc.is_map)
+    assert_eq(wc.label, Repeated)
+    assert_eq(wc.json_name, "wordCounts")
+    assert_eq(wc.ty, Named("WordCountsEntry", ".M.WordCountsEntry", Message))
+    refused("syntax = \"proto3\"; message M { map<float, int32> m = 1; }", "`float` cannot be a map's key")
+    refused("syntax = \"proto3\"; message M { map<M, int32> m = 1; }", "`M` cannot be a map's key")
+
+@test("a oneof's members carry its index, and take no label")
+oneofs()
+    val s = ok("""
+        syntax = "proto3";
+        message M { int32 a = 1; oneof pick { string s = 2; M m = 3; } oneof other { bool b = 4; } }
+        """)
+    val m = s.files[0].messages[0]
+    assert_eq(m.oneofs.len(), 2)
+    assert_eq(field_named(m, "a").oneof, None)
+    assert_eq(field_named(m, "s").oneof, Some(0))
+    assert_eq(field_named(m, "b").oneof, Some(1))
+    refused("syntax = \"proto3\"; message M { oneof o { repeated int32 a = 1; } }", "a oneof's fields take no label")
+    refused("syntax = \"proto3\"; message M { oneof o { } }", "oneof `o` has no fields")
+
+@test("an inner type shadows an outer one of the same name, completely")
+shadowing()
+    val s = ok("""
+        syntax = "proto3";
+        package p;
+        message T { int32 outer = 1; }
+        message A {
+          message T { int32 inner = 1; }
+          T here = 1;
+          .p.T there = 2;
+          message B { T deeper = 1; A.T qualified = 2; }
+        }
+        """)
+    val a = s.files[0].messages[1]
+    assert_eq(field_named(a, "here").ty, Named("T", ".p.A.T", Message))
+    assert_eq(field_named(a, "there").ty, Named(".p.T", ".p.T", Message))
+    val b = a.messages[1]
+    assert_eq(field_named(b, "deeper").ty, Named("T", ".p.A.T", Message))
+    assert_eq(field_named(b, "qualified").ty, Named("A.T", ".p.A.T", Message))
+    // `A.X` finds `A` and then must find `X` in it: it does not go on looking outward.
+    refused("""
+        syntax = "proto3";
+        message X {}
+        message A { message B { A.X x = 1; } }
+        """, "`A.X` is not defined: `A` has no `X` in it")
+
+@test("a field name is not a type, so a lookup passes over it")
+fields_are_not_types()
+    val s = ok("""
+        syntax = "proto3";
+        message Inner {}
+        message M { int32 Inner = 1; Inner x = 2; }
+        """)
+    assert_eq(field_named(s.files[0].messages[1], "x").ty, Named("Inner", ".Inner", Message))
+
+@test("imports are found by name, public imports pass through, and a type from a file not imported is refused")
+imports()
+    val table = files([
+        ("base.proto", "syntax = \"proto3\"; package base; message B { int32 x = 1; }"),
+        ("relay.proto", "syntax = \"proto3\"; import public \"base.proto\"; package relay; message R { base.B b = 1; }"),
+        ("top.proto", "syntax = \"proto3\"; import \"relay.proto\"; package top; message T { base.B b = 1; relay.R r = 2; }"),
+        ("hidden.proto", "syntax = \"proto3\"; import \"top.proto\"; message H { base.B b = 1; }"),
+    ])
+    val s = load_with(["top.proto"], table).unwrap()
+    assert_eq(s.files.len(), 3)
+    assert_eq(s.files[0].name, "base.proto")
+    assert_eq(s.files[2].name, "top.proto")
+    assert_eq(field_named(s.message(".top.T").unwrap(), "b").ty, Named("base.B", ".base.B", Message))
+    load_with(["hidden.proto"], table) match
+        Ok(_) -> panic("a type from a file not imported resolved")
+        Err(e) -> assert(e.contains("`base.B` is declared in base.proto, which this file does not import"), e)
+
+@test("an import that is missing, or that closes a cycle, is refused at the import")
+bad_imports()
+    load_with(["a.proto"], files([("a.proto", "syntax = \"proto3\";\nimport \"nope.proto\";")])) match
+        Ok(_) -> panic("a missing import resolved")
+        Err(e) ->
+            assert(e.contains("`nope.proto` is not found"), e)
+            assert(e.contains("a.proto:2:1"), e)
+    val cycle = files([("a.proto", "syntax = \"proto3\"; import \"b.proto\";"),
+                       ("b.proto", "syntax = \"proto3\"; import \"a.proto\";")])
+    load_with(["a.proto"], cycle) match
+        Ok(_) -> panic("an import cycle resolved")
+        Err(e) -> assert(e.contains("a.proto -> b.proto -> a.proto"), e)
+
+@test("enums: the first value is zero, aliases need allow_alias, and allow_alias needs an alias")
+enums()
+    val s = ok("""
+        syntax = "proto3";
+        enum E { option allow_alias = true; ZERO = 0; ONE = 1; UNO = 1; MINUS = -5; }
+        """)
+    val e = s.files[0].enums[0]
+    assert(e.allows_alias())
+    assert_eq(e.values[2].number, 1)
+    assert_eq(e.values[3].number, -5)
+    refused("syntax = \"proto3\"; enum E { A = 1; }", "the first value of a proto3 enum must be 0")
+    refused("syntax = \"proto3\"; enum E { A = 0; B = 0; }", "`B` has the number 0, which `A` already has")
+    refused("syntax = \"proto3\"; enum E { option allow_alias = true; A = 0; B = 1; }", "sets `allow_alias` but no two")
+    refused("syntax = \"proto3\"; enum E { A = 0; } enum F { A = 0; }", "`A` is already defined")
+    refused("syntax = \"proto3\"; enum E { A = 0; B = 2147483648; }", "does not fit an int32")
+
+@test("reserved numbers and names are kept and enforced")
+reserved_ranges()
+    val s = ok("""
+        syntax = "proto3";
+        message M { reserved 2, 15, 9 to 11, 40 to max; reserved "foo", "bar"; int32 a = 1; }
+        enum E { reserved -3 to -1, 5; reserved "OLD"; Z = 0; }
+        """)
+    val m = s.files[0].messages[0]
+    assert_eq(m.reserved.len(), 4)
+    assert_eq(m.reserved[2].start, 9)
+    assert_eq(m.reserved[2].end, 11)
+    assert_eq(m.reserved[3].end, 536870911)
+    assert_eq(m.reserved_names.view()[1], "bar")
+    assert_eq(s.files[0].enums[0].reserved[0].start, -3)
+    refused("syntax = \"proto3\"; message M { reserved 3 to 5; int32 a = 4; }", "uses number 4, which is reserved")
+    refused("syntax = \"proto3\"; message M { reserved \"a\"; int32 a = 1; }", "field name `a` is reserved")
+    refused("syntax = \"proto3\"; enum E { reserved 1; Z = 0; A = 1; }", "`A` uses 1, which is reserved")
+    refused("syntax = \"proto3\"; message M { reserved 5 to 3; }", "this range runs backwards")
+    refused("syntax = \"proto3\"; message M { reserved 1 to 5, 4; }", "overlaps an earlier one")
+
+@test("field numbers: in range, outside protobuf's own block, and used once")
+field_numbers()
+    refused("syntax = \"proto3\"; message M { int32 a = 0; }", "field number 0 is out of range")
+    refused("syntax = \"proto3\"; message M { int32 a = 536870912; }", "out of range")
+    refused("syntax = \"proto3\"; message M { int32 a = 19500; }", "reserved for protobuf's own use")
+    refused("syntax = \"proto3\"; message M { int32 a = 1; string b = 1; }", "field number 1 is already used by `a`")
+    refused("syntax = \"proto3\"; message M { int32 a = 1; string a = 2; }", "`M.a` is already defined")
+    refused("syntax = \"proto3\"; message M { int32 foo_bar = 1; string fooBar = 2; }", "has the JSON name `fooBar`")
+    val s = ok("syntax = \"proto3\"; message M { int32 a = 0x10; int32 b = 017; int32 c = 536870911; }")
+    val m = s.files[0].messages[0]
+    assert_eq(m.fields[0].number, 16)
+    assert_eq(m.fields[1].number, 15)
+
+@test("proto2's constructs are refused by name, where they are written")
+proto2_refused()
+    refused("message M {}", "a file without a `syntax` line is proto2")
+    refused("syntax = \"proto2\"; message M {}", "`syntax = \"proto2\"` is not supported")
+    refused("syntax = \"proto3\"; message M { required int32 a = 1; }", "`required` is proto2-only")
+    refused("syntax = \"proto3\"; message M { optional group G = 1 { } }", "a group is proto2-only")
+    refused("syntax = \"proto3\"; message M { extensions 100 to 200; }", "`extensions` is proto2-only")
+    refused("syntax = \"proto3\"; extend M { int32 x = 100; }", "`extend` is proto2-only")
+
+@test("options of every shape are kept as written, json_name is honoured, and a service is accepted")
+options()
+    val s = ok("""
+        syntax = "proto3";
+        option java_package = "com.example" 'x';
+        option (my.opt).part = -12;
+        option optimize_for = SPEED;
+        message M {
+          option (.full.name) = { a: 1 b: "}" };
+          double d = 1 [default_ish = -inf, (x) = 1.5e3];
+          int32 renamed = 2 [json_name = "other"];
+        }
+        service S { rpc Go (M) returns (M) { option deprecated = true; } }
+        """)
+    val f = s.files[0]
+    assert_eq(f.options[0].value, Text("com.examplex"))
+    assert_eq(f.options[1].name, "(my.opt).part")
+    assert_eq(f.options[1].value, Int(12, true))
+    assert_eq(f.options[2].value, Ident("SPEED"))
+    val m = f.messages[0]
+    assert_eq(m.options[0].name, "(.full.name)")
+    assert_eq(m.fields[0].options[0].value, Float("-inf"))
+    assert_eq(m.fields[0].options[1].value, Float("1.5e3"))
+    assert_eq(m.fields[1].json_name, "other")
+    assert_eq(f.services[0].name, "S")
+
+@test("protoc's derivations: JSON names and map entry names")
+derived_names()
+    assert_eq(json_name_of("foo_bar_baz"), "fooBarBaz")
+    assert_eq(json_name_of("_leading"), "Leading")
+    assert_eq(json_name_of("trailing_"), "trailing")
+    assert_eq(json_name_of("already_Upper2x"), "alreadyUpper2x")
+    assert_eq(json_name_of("a__b"), "aB")
+    assert_eq(entry_name_of("word_counts"), "WordCountsEntry")
+    assert_eq(entry_name_of("x"), "XEntry")
+
+@test("a diagnostic quotes the line and points at the place")
+diagnostics()
+    one("syntax = \"proto3\";\nmessage M {\n  int32 a = ;\n}\n") match
+        Ok(_) -> panic("a field with no number resolved")
+        Err(e) ->
+            assert(e.contains("error: expected a number"), e)
+            assert(e.contains("a.proto:3:13"), e)
+            assert(e.contains("3 |   int32 a = ;"), e)
+            assert(e.contains("^ found `;`"), e)
+    refused("syntax = \"proto3\";\nmessage M {\n  Missing m = 1;\n}\n", "`Missing` is not defined")
+    refused("syntax = \"proto3\"; message M { int32 a = 1; /* never closed", "this comment is never closed")
+    refused("syntax = \"proto3\"; message M { int32 a = 1;", "this message is never closed")
+    refused("syntax = \"proto3\"; message M { string s = 1 [x = \"open]; }", "unterminated")
+    refused("syntax = \"proto3\"; message M { int32 a = 12abc; }", "runs into the name after it")

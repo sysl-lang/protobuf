@@ -1,0 +1,193 @@
+module sh.sysl.protobuf.schema
+@tests
+@requires(heap, os)
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_temp_dir, read_text, remove_dir_all}
+import sysl.process.{Stdio, run}
+import sysl.testing.skip
+import sysl.text.{Search, join, split, to_upper}
+
+// protoc as the parser oracle. protoc reads a corpus and writes its own parse as a descriptor set;
+// `protoc --decode` turns that into text; and every message, field, number, label, type, type name,
+// JSON name, oneof, enum value and reserved range in it must be what this reader's model says, in the
+// same order. Both sides are written as one line per fact, so a difference is a line that differs.
+
+val PROTOC: string = "/opt/homebrew/bin/protoc"
+val DESCRIPTOR: string = "/opt/homebrew/include"
+
+// -- protoc's side --------------------------------------------------------------------------------
+
+// A node of protobuf's text format: `name: value`, or `name { kids }`.
+private struct Node
+    name: string
+    value: string
+    kids: Buf[Node]
+
+// The text format protoc prints: one field or one opening or closing brace a line.
+private parse_text(text: string) -> Node
+    val root = Node("", "", buf())
+    val stack: Buf[Node] = buf()
+    stack.push(root)
+    for raw in split(text, "\n")
+        val line = raw.trim()
+        if line == "" then continue
+        if line == "}" then
+            stack.pop()
+        elif line.ends_with(" {") then
+            val n = Node(line[0..<line.len - 2], "", buf())
+            stack[stack.len() - 1].kids.push(n)
+            stack.push(n)
+        else
+            val colon = line.index_of(": ").unwrap()
+            var value = line[colon + 2..<line.len]
+            if value.starts_with("\"") then value = value[1..<value.len - 1]
+            stack[stack.len() - 1].kids.push(Node(line[0..<colon], value, buf()))
+    root
+
+private get(n: Node, name: string) -> string
+    for k in n.kids
+        if k.name == name then return k.value
+    ""
+
+private all(n: Node, name: string) -> Buf[Node]
+    val out: Buf[Node] = buf()
+    for k in n.kids
+        if k.name == name then out.push(k)
+    out
+
+private protoc_facts(dir: string, files: []const string) -> Buf[string]
+    val set = f"$dir/set.pb"
+    val text = f"$dir/set.txt"
+    val args: Buf[string] = buf()
+    args.push(f"--descriptor_set_out=$set")
+    args.push("--include_imports")
+    args.push("-I")
+    args.push("testdata")
+    for f in files
+        args.push(f)
+    if !run(PROTOC, args.view()).unwrap().ok() then panic(f"protoc refused the corpus: $files")
+    val decoded = run(PROTOC, ["--decode=google.protobuf.FileDescriptorSet", "-I", DESCRIPTOR, "google/protobuf/descriptor.proto"],
+                      stdin = Stdio.FromPath(set), stdout = Stdio.ToPath(text)).unwrap()
+    assert(decoded.ok())
+    val out: Buf[string] = buf()
+    for file in all(parse_text(read_text(text).unwrap()), "file")
+        out.push(f"file ${get(file, "name")} package ${get(file, "package")}")
+        val pkg = get(file, "package")
+        val scope = if pkg == "" then "" else "." + pkg
+        for m in all(file, "message_type")
+            protoc_message(m, scope, out)
+        for e in all(file, "enum_type")
+            protoc_enum(e, scope, out)
+    out
+
+private protoc_message(m: Node, scope: string, out: Buf[string])
+    val full = scope + "." + get(m, "name")
+    var entry = false
+    for o in all(m, "options")
+        if get(o, "map_entry") == "true" then entry = true
+    out.push(f"message $full${if entry then " map_entry" else ""}")
+    val oneofs = all(m, "oneof_decl")
+    for fd in all(m, "field")
+        var line = f"  field ${get(fd, "name")} = ${get(fd, "number")} ${get(fd, "label")} ${get(fd, "type")}"
+        if get(fd, "type_name") != "" then line = line + " " + get(fd, "type_name")
+        line = line + " json=" + get(fd, "json_name")
+        if get(fd, "proto3_optional") == "true" then
+            line = line + " proto3_optional"
+        elif get(fd, "oneof_index") != "" then
+            line = line + " oneof=" + get(oneofs[usize(parse_int(get(fd, "oneof_index")))], "name")
+        out.push(line)
+    for r in all(m, "reserved_range")
+        out.push(f"  reserved ${get(r, "start")} to ${get(r, "end")} (exclusive)")
+    for n in all(m, "reserved_name")
+        out.push(f"  reserved name ${n.value}")
+    for n in all(m, "nested_type")
+        protoc_message(n, full, out)
+    for e in all(m, "enum_type")
+        protoc_enum(e, full, out)
+
+private protoc_enum(e: Node, scope: string, out: Buf[string])
+    out.push(f"enum $scope.${get(e, "name")}")
+    for v in all(e, "value")
+        out.push(f"  value ${get(v, "name")} = ${get(v, "number")}")
+    for r in all(e, "reserved_range")
+        out.push(f"  reserved ${get(r, "start")} to ${get(r, "end")} (inclusive)")
+    for n in all(e, "reserved_name")
+        out.push(f"  reserved name ${n.value}")
+
+private parse_int(text: string) -> long
+    var v: long = 0
+    var neg = false
+    for c in text.bytes
+        if c == u8('-') then neg = true else v = v * 10 + long(c - u8('0'))
+    if neg then -v else v
+
+// -- this reader's side ---------------------------------------------------------------------------
+
+private our_facts(s: Schema) -> Buf[string]
+    val out: Buf[string] = buf()
+    for f in s.files
+        out.push(f"file ${f.name} package ${f.package}")
+        for m in f.messages
+            our_message(m, out)
+        for e in f.enums
+            our_enum(e, out)
+    out
+
+private type_word(t: TypeRef) -> string = t match
+    ScalarType(s) -> "TYPE_" + to_upper(s.keyword())
+    Named(_, full, kind) -> (if kind == Message then "TYPE_MESSAGE " else "TYPE_ENUM ") + full
+
+private our_message(m: MessageDecl, out: Buf[string])
+    out.push(f"message ${m.full}${if m.map_entry then " map_entry" else ""}")
+    for fd in m.fields
+        val label = if fd.label == Repeated then "LABEL_REPEATED" else "LABEL_OPTIONAL"
+        var line = f"  field ${fd.name} = ${fd.number} $label ${type_word(fd.ty)} json=${fd.json_name}"
+        if fd.label == Optional then
+            line = line + " proto3_optional"
+        else
+            fd.oneof match
+                Some(k) -> line = line + " oneof=" + m.oneofs[k].name
+                None -> ()
+        out.push(line)
+    for r in m.reserved
+        out.push(f"  reserved ${r.start} to ${r.end + 1} (exclusive)")
+    for n in m.reserved_names
+        out.push(f"  reserved name $n")
+    for n in m.messages
+        our_message(n, out)
+    for e in m.enums
+        our_enum(e, out)
+
+private our_enum(e: EnumDecl, out: Buf[string])
+    out.push(f"enum ${e.full}")
+    for v in e.values
+        out.push(f"  value ${v.name} = ${v.number}")
+    for r in e.reserved
+        out.push(f"  reserved ${r.start} to ${r.end} (inclusive)")
+    for n in e.reserved_names
+        out.push(f"  reserved name $n")
+
+// -- the comparison -------------------------------------------------------------------------------
+
+private same_parse(name: string, files: []const string)
+    if !exists(PROTOC) then skip(f"$PROTOC is not installed (brew install protobuf)")
+    val dir = make_temp_dir(f"protobuf-parse-$name-").unwrap()
+    val theirs = protoc_facts(dir, files)
+    val ours = our_facts(load(files, ["testdata"]).unwrap())
+    remove_dir_all(dir).unwrap()
+    val n = if ours.len() < theirs.len() then ours.len() else theirs.len()
+    for i in 0..<n
+        if ours[i] != theirs[i] then
+            panic(f"the parses part at fact $i:\n  ours:   ${ours[i]}\n  protoc: ${theirs[i]}")
+    assert_eq(ours.len(), theirs.len())
+    // A check that compared nothing would pass too.
+    assert(ours.len() > 10)
+
+@test("protoc's parse: the encoding oracle's own schema, fact for fact")
+same_as_protoc_scalars()
+    same_parse("scalars", ["scalars.proto"])
+
+@test("protoc's parse: nested scopes, shadowing, aliases, reserved ranges, maps, oneofs and public imports")
+same_as_protoc_corpus()
+    same_parse("corpus", ["corpus/nested.proto", "corpus/user.proto"])

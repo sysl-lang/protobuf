@@ -1,0 +1,85 @@
+module sh.sysl.protobuf
+
+import sysl.buf.{Buf, buf}
+
+/** Where an encoding goes.
+ *
+ * An implementation supplies the two ways bytes arrive, and the format's three primitives are written
+ * on top of them here: varints, tags, and little-endian words. The field shapes a generated message is
+ * made of — a field left out at its default, a packed run — are the codecs' (`Codec`).
+ */
+trait Output
+    /** Appends one byte, or answers `Full` with the offset it would have gone at. */
+    put_byte(*self, b: u8) -> Result[unit, EncodeError]
+
+    /** Appends a run of bytes, all of them or none. */
+    put(*self, bytes: []const u8) -> Result[unit, EncodeError]
+
+    varint(*self, v: u64) -> Result[unit, EncodeError]
+        var x = v
+        while x >= 0x80
+            self.put_byte(u8(x & 0x7f) | 0x80)?
+            x >>= 7
+        self.put_byte(u8(x))
+
+    tag(*self, number: u32, wire: WireType) -> Result[unit, EncodeError] = self.varint(tag_of(number, wire))
+
+    // Little-endian, which is the format's byte order whatever the machine's is.
+    fixed32(*self, v: u32) -> Result[unit, EncodeError]
+        for i in 0..<4
+            self.put_byte(u8(v >> (8 * i)))?
+        Ok(())
+
+    fixed64(*self, v: u64) -> Result[unit, EncodeError]
+        for i in 0..<8
+            self.put_byte(u8(v >> (8 * i)))?
+        Ok(())
+end Output
+
+/** An output over storage the caller owns: a slice, filled from the front, which answers `Full` when
+ * the next byte has nowhere to go. It allocates nothing, so it is the one to use on a board.
+ *
+ *     var store: [64]u8 = [0; 64]
+ *     var out = slice_output(store[..])
+ *     msg.encode(&out)?
+ *     send(out.written())
+ */
+struct SliceOutput
+    out: []u8
+    at: usize
+
+    /** The bytes written so far. */
+    written(self) -> []u8 = self.out[..<self.at]
+
+/** An output that fills `out` from its first byte. */
+slice_output(out: []u8) -> SliceOutput = SliceOutput(out, 0)
+
+impl Output for SliceOutput
+    put_byte(*self, b: u8) -> Result[unit, EncodeError]
+        if self.at >= self.out.len then return Err(Full(self.at))
+        self.out[self.at] = b
+        self.at += 1
+        Ok(())
+
+    put(*self, bytes: []const u8) -> Result[unit, EncodeError]
+        if bytes.len > self.out.len - self.at then return Err(Full(self.at))
+        for i in 0..<bytes.len
+            self.out[self.at + i] = bytes[i]
+        self.at += bytes.len
+        Ok(())
+
+/** An output that grows a `Buf[u8]` as it goes, for a hosted program. It never answers `Full`. */
+struct BufOutput
+    bytes: Buf[u8]
+
+/** A growing output, empty. */
+buf_output() -> BufOutput = BufOutput(buf())
+
+impl Output for BufOutput
+    put_byte(*self, b: u8) -> Result[unit, EncodeError]
+        self.bytes.push(b)
+        Ok(())
+
+    put(*self, bytes: []const u8) -> Result[unit, EncodeError]
+        self.bytes.extend(bytes)
+        Ok(())

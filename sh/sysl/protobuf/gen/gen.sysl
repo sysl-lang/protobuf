@@ -1,0 +1,602 @@
+module sh.sysl.protobuf.gen
+
+import sh.sysl.protobuf.schema.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.{Search, join, split, to_lower}
+
+// The model written out as sysl: one module per `.proto` package, one file per `.proto` file.
+//
+// | `.proto` | sysl |
+// |---|---|
+// | `message M` | `struct M derives Eq, Display`, with `impl Message for M` |
+// | a nested `message I` in `M` | `struct MI`: the names joined, since sysl does not nest types |
+// | `enum E` | `enum E` with an `Unrecognized(value: i32)` variant, with `impl ProtoEnum for E` |
+// | a scalar | the sysl number type of its width, `bool`, `string`, or `Buf[u8]` for `bytes` |
+// | `optional T`, a message field | `Option[T]` |
+// | `repeated T`, `map<K, V>` | `Buf[T]`; a map is a `Buf` of its entry messages, in wire order |
+// | `oneof o` in `M` | a field `o: Option[MO]`, where `enum MO` has one variant per member |
+//
+// Every type also gets a codec alias, `type MCodec = MessageOf[M]`, that fields of it are written and
+// read through.
+
+/** One generated file: where it goes under an output directory, the module it declares, and its
+ * text. */
+struct GeneratedFile derives Eq, Display
+    path: string
+    module_name: string
+    text: string
+
+/** The sysl source for one loaded file, by its import name. */
+generate(s: Schema, name: string) -> Result[GeneratedFile, string]
+    val file = s.file(name).ok_or(s"error: `$name` was not loaded")?
+    if file.package == "" then
+        return Err(s"error: ${file.name} has no `package`, and a generated module needs a name — add `package <name>;`")
+    for part in split(file.package, ".")
+        if is_reserved(part) then
+            return Err(s"error: ${file.name}'s package `${file.package}` has `$part` in it, which is a reserved word in sysl and cannot name a module")
+    val names = names_of(s)?
+    for m in file.messages
+        no_cycles(s, m)?
+    var g = Gen(s, names, file, buf(), map(), buf(), buf())
+    for m in file.messages
+        message(&g, m)
+    for e in file.enums
+        enum_decl(&g, e)
+    codec_aliases(&g, file)
+    val used_names = g.runtime.copy()
+    used_names.extend(g.bufs.view())
+    for used in used_names
+        for (full, n) in names
+            if n.module_name == file.package && n.name == used then
+                return Err(s"error: `${bare(full)}` would be called `$used` in sysl, which the generated code also uses from ${if used == "Buf" then "sysl.buf" else "sh.sysl.protobuf"} — rename it")
+    Ok(GeneratedFile(module_path(file), file.package, assemble(&g, file)))
+
+// A message may not contain itself by value: through a singular message field, or a oneof member, a
+// chain that comes back to where it began would be a struct of no finite size. A repeated field or
+// a map breaks the chain, since a `Buf` holds its elements elsewhere.
+private[gen] no_cycles(s: Schema, m: MessageDecl) -> Result[unit, string]
+    no_cycle(s, m, buf())?
+    for n in m.messages
+        no_cycles(s, n)?
+    Ok(())
+
+private[gen] no_cycle(s: Schema, m: MessageDecl, path: Buf[string]) -> Result[unit, string]
+    for p in path
+        if p == m.full then
+            return Err(s"error: `${bare(m.full)}` contains itself by value (${join(path.view(), " -> ")} -> ${m.full}), and recursive messages are not generated yet — a repeated field in the chain is the shape that is")
+    path.push(m.full)
+    for f in m.fields
+        if f.label != Repeated then
+            f.ty match
+                Named(_, full, kind) ->
+                    if kind == Message then no_cycle(s, s.message(full).unwrap(), path)?
+                ScalarType(_) -> ()
+    path.pop()
+    Ok(())
+
+/** Every loaded file named in `names`, generated. */
+generate_all(s: Schema, names: []const string) -> Result[Buf[GeneratedFile], string]
+    val out: Buf[GeneratedFile] = buf()
+    for n in names
+        out.push(generate(s, n)?)
+    Ok(out)
+
+// `pkg/sub/name.sysl` for `name.proto` in package `pkg.sub`.
+private[gen] module_path(f: ProtoFile) -> string
+    val slash = f.name.last_index_of("/").map(i -> i + 1).unwrap_or(0)
+    var base = f.name[slash..<f.name.len]
+    if base.ends_with(".proto") then base = base[0..<base.len - 6]
+    val stem = identifier_of(base)
+    join(split(f.package, "."), "/") + "/" + stem + ".sysl"
+
+// A file stem made into a word a file system and a reader both accept.
+private[gen] identifier_of(text: string) -> string
+    val out: Buf[u8] = buf()
+    for c in text.bytes
+        out.push(if (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || (c >= u8('0') && c <= u8('9')) then c else u8('_'))
+    sysl.text.from_utf8_unchecked(out.view())
+
+// -- names ----------------------------------------------------------------------------------------
+
+/** What a proto type is called in sysl: the module it is in and its name there. */
+struct Named derives Eq, Display
+    module_name: string
+    name: string
+
+// Every message and enum in the schema given its sysl name, every name checked against the others in
+// its module, and the oneof enums and codec aliases given names that fit beside them.
+private[gen] names_of(s: Schema) -> Result[Map[string, Named], string]
+    val out: Map[string, Named] = map()
+    val taken: Map[string, string] = map()
+    for f in s.files
+        for m in f.messages
+            name_message(f, m, "", out, taken)?
+        for e in f.enums
+            claim(f, e.full, e.name, out, taken)?
+    Ok(out)
+
+private[gen] name_message(f: ProtoFile, m: MessageDecl, outer: string, out: Map[string, Named], taken: Map[string, string]) -> Result[unit, string]
+    val name = outer + m.name
+    claim(f, m.full, name, out, taken)?
+    for n in m.messages
+        name_message(f, n, name, out, taken)?
+    for e in m.enums
+        claim(f, e.full, name + e.name, out, taken)?
+    Ok(())
+
+private[gen] claim(f: ProtoFile, full: string, name: string, out: Map[string, Named], taken: Map[string, string]) -> Result[unit, string]
+    val key = f.package + " " + name
+    taken.get(key) match
+        Some(other) ->
+            return Err(s"error: `${bare(full)}` and `${bare(other)}` would both be called `$name` in module ${f.package}, since nested names are joined — rename one of them")
+        None -> ()
+    taken.put(key, full)
+    taken.put(key + "Codec", full)
+    out.put(full, Named(f.package, name))
+    Ok(())
+
+private[gen] is_reserved(word: string) -> bool
+    for w in ["alignof", "as", "break", "const", "continue", "defer", "do", "elif", "else", "ensure", "enum",
+              "extern", "false", "for", "if", "impl", "import", "in", "loop", "match", "module", "null",
+              "offsetof", "override", "private", "ref", "require", "return", "self", "sizeof", "static",
+              "struct", "then", "trait", "true", "type", "val", "var", "weak", "while"]
+        if w == word then return true
+    false
+
+// The members every generated message has, which a field may not share a name with.
+private[gen] is_member(word: string) -> bool
+    for w in ["empty", "encoded_size", "encode", "merge", "decode", "to_bytes"]
+        if w == word then return true
+    false
+
+/** A field's name in sysl: as written, quoted where it is a reserved word, and with `_` after it
+ * where it would collide with a member every message has. */
+field_name(name: string) -> string =
+    if is_reserved(name) then "`" + name + "`"
+    elif is_member(name) then name + "_"
+    else name
+
+/** `SCREAMING_CASE` in camel case: `HOME_ADDRESS` is `HomeAddress`. */
+camel(word: string) -> string
+    val out: Buf[u8] = buf()
+    var upper = true
+    for c in word.bytes
+        if c == u8('_') then
+            upper = true
+        elif upper then
+            out.push(if c >= u8('a') && c <= u8('z') then c - 32 else c)
+            upper = false
+        else
+            out.push(if c >= u8('A') && c <= u8('Z') then c + 32 else c)
+    sysl.text.from_utf8_unchecked(out.view())
+
+/** An enum's variant names: each value in camel case, with the enum's own name taken off the front
+ * where every value carries it (`PHONE_TYPE_MOBILE` in `PhoneType` is `Mobile`) and what is left still
+ * starts with a letter. */
+variant_names(e: EnumDecl) -> Buf[string]
+    val prefix = screaming(e.name) + "_"
+    var strip = true
+    for v in e.values
+        if !v.name.starts_with(prefix) || v.name.len == prefix.len then
+            strip = false
+        elif !is_letter(v.name[prefix.len]) then
+            strip = false
+    val out: Buf[string] = buf()
+    for v in e.values
+        out.push(camel(if strip then v.name[prefix.len..<v.name.len] else v.name))
+    out
+
+private[gen] is_letter(c: u8) -> bool = (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z'))
+
+// `PhoneType` as its values would spell it: `PHONE_TYPE`.
+private[gen] screaming(name: string) -> string
+    val out: Buf[u8] = buf()
+    for i in 0..<name.len
+        val c = name[i]
+        if c >= u8('A') && c <= u8('Z') then
+            if i > 0 && name[i - 1] >= u8('a') && name[i - 1] <= u8('z') then out.push(u8('_'))
+            out.push(c)
+        elif c >= u8('a') && c <= u8('z') then
+            out.push(c - 32)
+        else
+            out.push(c)
+    sysl.text.from_utf8_unchecked(out.view())
+
+// -- writing --------------------------------------------------------------------------------------
+
+private[gen] struct Gen
+    s: Schema
+    names: Map[string, Named]
+    file: ProtoFile
+    lines: Buf[string]
+    // Names this file uses from another module, by module.
+    foreign: Map[string, Buf[string]]
+    // Names it uses from the runtime and from `sysl.buf`.
+    runtime: Buf[string]
+    bufs: Buf[string]
+
+    // Notes a runtime name as used, and answers it.
+    rt(*self, name: string) -> string
+        if !has(self.runtime, name) then self.runtime.push(name)
+        name
+
+    // Notes `Buf` or `buf` as used, and answers it.
+    sb(*self, name: string) -> string
+        if !has(self.bufs, name) then self.bufs.push(name)
+        name
+
+    line(*self, depth: int, text: string)
+        if text == "" then
+            self.lines.push("")
+            return
+        var pad = ""
+        for _ in 0..<depth
+            pad = pad + "    "
+        self.lines.push(pad + text)
+
+    // The sysl name of a resolved proto type, noting an import where it lives in another module.
+    type_name(*self, full: string) -> string
+        val n = self.names.get(full).unwrap()
+        if n.module_name != self.file.package then
+            val wanted = self.foreign.get(n.module_name) match
+                Some(b) -> b
+                None ->
+                    val b: Buf[string] = buf()
+                    self.foreign.put(n.module_name, b)
+                    b
+            if !has(wanted, n.name) then
+                wanted.push(n.name)
+                wanted.push(n.name + "Codec")
+        n.name
+end Gen
+
+private[gen] has(names: Buf[string], name: string) -> bool
+    for n in names
+        if n == name then return true
+    false
+
+private[gen] assemble(g: *Gen, f: ProtoFile) -> string
+    val head: Buf[string] = buf()
+    head.push(s"// Generated by protoc-sysl from ${f.name}. Edit the .proto file and generate it again rather than")
+    head.push("// editing this one.")
+    head.push("")
+    head.push(s"module ${f.package}")
+    head.push("")
+    val modules: Buf[string] = buf()
+    for (name, _) in g.foreign
+        modules.push(name)
+    for name in sorted(modules)
+        head.push(s"import $name.{${join(sorted(g.foreign.get(name).unwrap()).view(), ", ")}}")
+    head.push(s"import sh.sysl.protobuf.{${join(sorted(g.runtime).view(), ", ")}}")
+    if !g.bufs.is_empty() then
+        head.push(if g.bufs.len() == 2 then "import sysl.buf.{Buf, buf}" else s"import sysl.buf.${g.bufs[0]}")
+    head.push("")
+    var body = g.lines
+    // No blank line at the end, and exactly one newline.
+    while body.len() > 0 && body[body.len() - 1] == ""
+        body.pop()
+    join(head.view(), "\n") + "\n" + join(body.view(), "\n") + "\n"
+
+private[gen] sorted(names: Buf[string]) -> Buf[string]
+    val out = names.copy()
+    for i in 1..<out.len()
+        var j = i
+        while j > 0 && out[j - 1] > out[j]
+            val t = out[j - 1]
+            out.set(j - 1, out[j])
+            out.set(j, t)
+            j -= 1
+    out
+
+// -- messages -------------------------------------------------------------------------------------
+
+/** How one field is held and carried. */
+private[gen] struct Plan
+    field: FieldDecl
+    // The sysl name of the field.
+    name: string
+    // The sysl type of one value.
+    value_type: string
+    // The codec its values go through: `Int32`, `PersonCodec`.
+    codec: string
+    // What it is when the message is empty.
+    default: string
+    // Whether it is a map entry's key or value, which are written whatever their value: protoc's
+    // encoders write both, so a reader sees an entry whole.
+    in_entry: bool
+
+private[gen] plan(g: *Gen, m: MessageDecl, f: FieldDecl) -> Plan
+    val (value_type, codec, default) = f.ty match
+        ScalarType(s) ->
+            val (t, c, d) = scalar_plan(s)
+            if s == Scalar.Bytes then
+                g.sb("Buf")
+                g.sb("buf")
+            (t, g.rt(c), d)
+        Named(_, full, kind) ->
+            val n = g.type_name(full)
+            if kind == Enum then (n, n + "Codec", n + "." + first_variant(g, full))
+            elif m.map_entry then (n, n + "Codec", n + ".empty()")
+            else (n, n + "Codec", "None")
+    Plan(f, field_name(f.name), value_type, codec, default, m.map_entry)
+
+private[gen] first_variant(g: *Gen, full: string) -> string = variant_names(g.s.enum_named(full).unwrap())[0]
+
+private[gen] scalar_plan(s: Scalar) -> (string, string, string) = s match
+    Double -> ("real", "Double", "0.0")
+    Float -> ("f32", "Float", "0.0")
+    Int64 -> ("i64", "Int64", "0")
+    UInt64 -> ("u64", "UInt64", "0")
+    Int32 -> ("i32", "Int32", "0")
+    Fixed64 -> ("u64", "Fixed64", "0")
+    Fixed32 -> ("u32", "Fixed32", "0")
+    Bool -> ("bool", "Bool", "false")
+    Str -> ("string", "Str", "\"\"")
+    Bytes -> ("Buf[u8]", "Bytes", "buf()")
+    UInt32 -> ("u32", "UInt32", "0")
+    SFixed32 -> ("i32", "SFixed32", "0")
+    SFixed64 -> ("i64", "SFixed64", "0")
+    SInt32 -> ("i32", "SInt32", "0")
+    SInt64 -> ("i64", "SInt64", "0")
+
+private[gen] is_message(f: FieldDecl) -> bool = f.ty match
+    Named(_, _, kind) -> kind == Message
+    ScalarType(_) -> false
+
+// The type a field is declared with in the struct.
+private[gen] field_type(g: *Gen, p: Plan) -> string
+    if p.field.label == Repeated then return s"${g.sb("Buf")}[${p.value_type}]"
+    if p.field.label == Optional || (is_message(p.field) && !p.in_entry) then return s"Option[${p.value_type}]"
+    p.value_type
+
+// What a field is in an empty message.
+private[gen] field_default(g: *Gen, p: Plan) -> string
+    if p.field.label == Repeated then return g.sb("buf") + "()"
+    if p.field.label == Optional then return "None"
+    p.default
+
+private[gen] message(g: *Gen, m: MessageDecl)
+    val name = g.type_name(m.full)
+    val plans: Buf[Plan] = buf()
+    for f in m.fields
+        plans.push(plan(g, m, f))
+    val oneof_names: Buf[string] = buf()
+    for o in m.oneofs
+        oneof_names.push(oneof_type(g, name, o.name))
+
+    // The struct: its fields in the order they were written, a oneof where its first member is.
+    val members: Buf[string] = buf()
+    val defaults: Buf[string] = buf()
+    for p in plans
+        p.field.oneof match
+            Some(k) ->
+                if first_member(m, k) == p.field.number then
+                    members.push(s"${field_name(m.oneofs[k].name)}: Option[${oneof_names[k]}]")
+                    defaults.push("None")
+            None ->
+                members.push(s"${p.name}: ${field_type(g, p)}")
+                defaults.push(field_default(g, p))
+    g.line(0, s"struct $name derives Eq, Display")
+    for text in members
+        g.line(1, text)
+    if members.len() == 0 || members.len() >= 5 then g.line(0, s"end $name")
+    g.line(0, "")
+
+    for k in 0..<m.oneofs.len()
+        oneof_enum(g, m, k, oneof_names[k], plans)
+
+    val ordered = by_number(plans)
+    if !plans.is_empty() then g.rt("Codec")
+    // `Message.to_bytes` answers a `Buf[u8]`, and an implementing module has to have the name.
+    g.sb("Buf")
+    g.line(0, s"impl ${g.rt("Message")} for $name")
+    g.line(1, s"empty() -> $name = $name(${join(defaults.view(), ", ")})")
+    g.line(0, "")
+    size_fn(g, m, ordered, oneof_names)
+    g.line(0, "")
+    encode_fn(g, m, ordered, oneof_names)
+    g.line(0, "")
+    merge_fn(g, m, ordered, oneof_names)
+    g.line(0, "")
+
+    for n in m.messages
+        message(g, n)
+    for e in m.enums
+        enum_decl(g, e)
+end message
+
+// A oneof's enum: the message's name and the oneof's, with `Oneof` after where that is taken.
+private[gen] oneof_type(g: *Gen, message: string, oneof: string) -> string
+    val name = message + camel(oneof)
+    for (_, n) in g.names
+        if n.module_name == g.file.package && (n.name == name || n.name + "Codec" == name) then return name + "Oneof"
+    name
+
+private[gen] first_member(m: MessageDecl, k: usize) -> u32
+    for f in m.fields
+        if f.oneof == Some(k) then return f.number
+    0
+
+private[gen] by_number(plans: Buf[Plan]) -> Buf[Plan]
+    val out = plans.copy()
+    for i in 1..<out.len()
+        var j = i
+        while j > 0 && out[j - 1].field.number > out[j].field.number
+            val t = out[j - 1]
+            out.set(j - 1, out[j])
+            out.set(j, t)
+            j -= 1
+    out
+
+private[gen] oneof_enum(g: *Gen, m: MessageDecl, k: usize, name: string, plans: Buf[Plan])
+    g.line(0, s"enum $name derives Eq, Display")
+    var count = 0
+    for p in plans
+        if p.field.oneof == Some(k) then
+            g.line(1, s"${camel(p.field.name)}(v: ${p.value_type})")
+            count += 1
+    if count >= 5 then g.line(0, s"end $name")
+    g.line(0, "")
+
+// A run of fields in number order that a block covers: one field, or the consecutive members of one
+// oneof.
+private[gen] struct Run
+    plans: Buf[Plan]
+    oneof: Option[usize]
+
+private[gen] runs(ordered: Buf[Plan]) -> Buf[Run]
+    val out: Buf[Run] = buf()
+    for p in ordered
+        if out.len() > 0 && p.field.oneof.is_some() && out[out.len() - 1].oneof == p.field.oneof then
+            out[out.len() - 1].plans.push(p)
+        else
+            val b: Buf[Plan] = buf()
+            b.push(p)
+            out.push(Run(b, p.field.oneof))
+    out
+
+// The call that writes, or measures, a field that is not a oneof member: `Str.field(out, 1,
+// self.name)` and `Str.field_size(1, self.name)`.
+private[gen] shape(p: Plan) -> string
+    if p.field.label == Repeated then return if p.field.packed() then "packed" else "repeated"
+    if p.in_entry then return "present"
+    if p.field.label == Optional || is_message(p.field) then return "optional"
+    "field"
+
+private[gen] argument(p: Plan) -> string =
+    if p.field.label == Repeated then s"self.${p.name}.view()" else s"self.${p.name}"
+
+private[gen] size_fn(g: *Gen, m: MessageDecl, ordered: Buf[Plan], oneofs: Buf[string])
+    val all = runs(ordered)
+    if all.len() == 0 then
+        g.line(1, "encoded_size(self) -> usize = 0")
+        return
+    g.line(1, "encoded_size(self) -> usize")
+    val start = g.lines.len()
+    var first = true
+    for run in all
+        run.oneof match
+            None ->
+                val p = run.plans[0]
+                val e = s"${p.codec}.${shape(p)}_size(${p.field.number}, ${argument(p)})"
+                g.line(2, if first then s"var n = $e" else s"n += $e")
+            Some(k) ->
+                if first then g.line(2, "var n: usize = 0")
+                g.line(2, s"n += self.${field_name(m.oneofs[k].name)} match")
+                for p in run.plans
+                    g.line(3, s"Some(${oneofs[k]}.${camel(p.field.name)}(v)) -> ${p.codec}.present_size(${p.field.number}, v)")
+                g.line(3, if run.plans.len() == count_members(m, k) then "None -> 0" else "_ -> 0")
+        first = false
+    g.line(2, "n")
+    if g.lines.len() - start + 1 >= 6 then g.line(1, "end encoded_size")
+
+private[gen] count_members(m: MessageDecl, k: usize) -> usize
+    var n: usize = 0
+    for f in m.fields
+        if f.oneof == Some(k) then n += 1
+    n
+
+private[gen] encode_fn(g: *Gen, m: MessageDecl, ordered: Buf[Plan], oneofs: Buf[string])
+    val all = runs(ordered)
+    val head = s"encode[O: ${g.rt("Output")}](self, out: *O) -> Result[unit, ${g.rt("EncodeError")}]"
+    if all.len() == 0 then
+        g.line(1, head + " = Ok(())")
+        return
+    g.line(1, head)
+    val start = g.lines.len()
+    for run in all
+        run.oneof match
+            None ->
+                val p = run.plans[0]
+                g.line(2, s"${p.codec}.${shape(p)}(out, ${p.field.number}, ${argument(p)})?")
+            Some(k) ->
+                g.line(2, s"self.${field_name(m.oneofs[k].name)} match")
+                for p in run.plans
+                    g.line(3, s"Some(${oneofs[k]}.${camel(p.field.name)}(v)) -> ${p.codec}.present(out, ${p.field.number}, v)?")
+                g.line(3, if run.plans.len() == count_members(m, k) then "None -> ()" else "_ -> ()")
+    g.line(2, "Ok(())")
+    if g.lines.len() - start + 1 >= 6 then g.line(1, "end encode")
+
+private[gen] merge_fn(g: *Gen, m: MessageDecl, ordered: Buf[Plan], oneofs: Buf[string])
+    g.line(1, s"merge(*self, r: *${g.rt("Reader")}) -> Result[unit, ${g.rt("DecodeError")}]")
+    val start = g.lines.len()
+    g.line(2, "while r.more()")
+    g.line(3, "val f = r.field()?")
+    if ordered.len() == 0 then
+        g.line(3, "r.skip(f)?")
+    else
+        g.line(3, "f.number match")
+        for p in ordered
+            g.line(4, s"${p.field.number} -> ${read_into(g, m, p, oneofs)}")
+        g.line(4, "_ -> r.skip(f)?")
+    g.line(2, "Ok(())")
+    if g.lines.len() - start + 1 >= 6 then g.line(1, "end merge")
+
+// What reading one occurrence of a field does.
+private[gen] read_into(g: *Gen, m: MessageDecl, p: Plan, oneofs: Buf[string]) -> string
+    p.field.oneof match
+        Some(k) -> return s"self.${field_name(m.oneofs[k].name)} = Some(${oneofs[k]}.${camel(p.field.name)}(${p.codec}.read(r, f)?))"
+        None -> ()
+    if p.field.label == Repeated then return s"${p.codec}.read_repeated(r, f, self.${p.name})?"
+    if is_message(p.field) then
+        val merge = g.rt("merge_message")
+        if p.in_entry then return s"self.${p.name} = $merge(r, f, Some(self.${p.name}))?"
+        return s"self.${p.name} = Some($merge(r, f, self.${p.name})?)"
+    if p.field.label == Optional then return s"self.${p.name} = Some(${p.codec}.read(r, f)?)"
+    s"self.${p.name} = ${p.codec}.read(r, f)?"
+
+// -- enums ----------------------------------------------------------------------------------------
+
+private[gen] enum_decl(g: *Gen, e: EnumDecl)
+    val name = g.type_name(e.full)
+    val variants = variant_names(e)
+    // A value that shares its number with an earlier one is an alias: the earlier name is the variant.
+    val primary: Buf[usize] = buf()
+    for i in 0..<e.values.len()
+        var first = true
+        for j in 0..<i
+            if e.values[j].number == e.values[i].number then first = false
+        if first then primary.push(i)
+    g.line(0, s"enum $name derives Eq, Display")
+    for i in primary
+        g.line(1, variants[i])
+        for j in 0..<e.values.len()
+            if j != i && e.values[j].number == e.values[i].number then
+                g.line(1, s"// ${e.values[j].name} is another name for this value.")
+    g.line(1, "// A number this schema does not name, kept so that it is written back unchanged.")
+    g.line(1, "Unrecognized(value: i32)")
+    if primary.len() + 2 >= 5 then g.line(0, s"end $name")
+    g.line(0, "")
+    g.line(0, s"impl ${g.rt("ProtoEnum")} for $name")
+    g.line(1, "value -> i32 = self match")
+    for i in primary
+        g.line(2, s"${variants[i]} -> ${e.values[i].number}")
+    g.line(2, "Unrecognized(v) -> v")
+    g.line(0, "")
+    g.line(1, s"from_value(v: i32) -> $name = v match")
+    for i in primary
+        g.line(2, s"${e.values[i].number} -> ${variants[i]}")
+    g.line(2, "_ -> Unrecognized(v)")
+    g.line(0, "")
+
+// The codec alias for every type the file declares, at its end.
+private[gen] codec_aliases(g: *Gen, f: ProtoFile)
+    val all: Buf[string] = buf()
+    for m in f.messages
+        message_aliases(g, m, all)
+    for e in f.enums
+        all.push(s"type ${g.type_name(e.full)}Codec = ${g.rt("EnumOf")}[${g.type_name(e.full)}]")
+    if all.is_empty() then return
+    g.line(0, "// The codecs fields of these types are written and read through.")
+    for a in all
+        g.line(0, a)
+
+private[gen] message_aliases(g: *Gen, m: MessageDecl, all: Buf[string])
+    val n = g.type_name(m.full)
+    all.push(s"type ${n}Codec = ${g.rt("MessageOf")}[$n]")
+    for inner in m.messages
+        message_aliases(g, inner, all)
+    for e in m.enums
+        val en = g.type_name(e.full)
+        all.push(s"type ${en}Codec = ${g.rt("EnumOf")}[$en]")

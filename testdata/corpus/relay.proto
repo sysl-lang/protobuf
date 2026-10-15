@@ -1,0 +1,10 @@
+// Passes base.proto on to whoever imports this file.
+syntax = "proto3";
+
+package corpus.relay;
+
+import public "corpus/base.proto";
+
+message Relay {
+  corpus.base.Shared shared = 1;
+}

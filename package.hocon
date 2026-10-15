@@ -1,0 +1,28 @@
+// Protocol Buffers for sysl, in pure sysl: the wire-format runtime generated code calls
+// (`sh.sysl.protobuf`), a `.proto` reader that resolves a schema into a model
+// (`sh.sysl.protobuf.schema`), and a generator that writes that model out as sysl
+// (`sh.sysl.protobuf.gen`). The command `protoc-sysl` in `tools/` is a thin layer over the last two.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       protobuf { git = "github.com/sysl-lang/protobuf", version = "<the first tag>" }
+//     }
+//
+// **The runtime needs no operating system and no heap to encode**: a message is written into a slice
+// the caller owns, and `tools/portable` builds that for a freestanding target. Reading a `string`,
+// `bytes` or repeated field allocates, since what was read has to be put somewhere; the schema reader
+// and the generator are hosted code.
+
+package {
+  name    = "protobuf"
+  version = "0.0.1"
+}
+
+dependencies {
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.0" }
+}
+
+
+// `tools/protoc-sysl` is the command; `tools/portable` is the freestanding probe.
+workspace = ["tools/*"]

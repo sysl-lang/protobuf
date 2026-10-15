@@ -1,0 +1,11 @@
+// protoc-sysl: turn .proto files into sysl modules. The command line is a thin layer over
+// `sh.sysl.protobuf.gen.run_cli`, which the package's own tests drive.
+
+package {
+  name    = "protoc-sysl"
+  version = "0.0.1"
+}
+
+dependencies {
+  protobuf { workspace = true }
+}

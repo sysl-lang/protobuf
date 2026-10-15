@@ -1,0 +1,494 @@
+module sh.sysl.protobuf.schema
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// Reading one `.proto` file: recursive descent over `sh.sysl.parsing`'s cursor, straight into the
+// model. The grammar is the proto3 language specification's
+// (protobuf.dev/reference/protobuf/proto3-spec). The cursor, the spans, the digit readers and the
+// diagnostic that quotes the line all come from the toolkit; what is written here is protobuf.
+//
+// **What proto2 has and proto3 does not is refused by name**, at the place it is written: `required`,
+// groups, `extensions` and `extend`, a `syntax` other than proto3, and editions.
+
+/** One file read into the model, or the first thing wrong with it.
+ *
+ * `name` is what the file is called in its imports and its diagnostics; the caller builds the
+ * `Source` and keeps it, so that a diagnostic can be drawn against it later. */
+parse_file(name: string, src: Source) -> Result[ProtoFile, Diagnostic]
+    var p = Parser(src, scan(src))
+    var file = ProtoFile(name, src, "", buf(), buf(), buf(), buf(), buf())
+    p.ws()?
+    if !p.word("syntax") then
+        return Err(error(p.s.here(), "a file without a `syntax` line is proto2, which is not supported")
+            .with_note("begin the file with `syntax = \"proto3\";`"))
+    syntax(&p)?
+    var saw_package = false
+    loop
+        p.ws()?
+        if p.s.at_end() then break
+        val start = p.s.offset
+        if p.s.accept(u8(';')) then continue
+        if p.word("import") then
+            file.imports.push(import_decl(&p, start)?)
+        elif p.word("package") then
+            if saw_package then return Err(error(p.since(start), "a file may have only one `package` line"))
+            p.ws()?
+            file.package = p.full_ident()?.0
+            p.expect(u8(';'), "`;` after the package name")?
+            saw_package = true
+        elif p.word("option") then
+            file.options.push(option_decl(&p, start)?)
+        elif p.word("message") then
+            file.messages.push(message(&p, start)?)
+        elif p.word("enum") then
+            file.enums.push(enum_decl(&p, start)?)
+        elif p.word("service") then
+            file.services.push(service(&p, start)?)
+        elif p.word("extend") then
+            return Err(refused(p.since(start), "`extend`", "extensions"))
+        else
+            return Err(p.unexpected("`message`, `enum`, `import`, `package`, `option` or `service`"))
+    Ok(file)
+end parse_file
+
+private[schema] struct Parser
+    src: Source
+    s: Scanner
+
+    // Whitespace and both kinds of comment.
+    ws(*self) -> Result[unit, Diagnostic]
+        loop
+            self.s.skip_space()
+            if self.s.skip_line_comment("//".bytes) then continue
+            self.s.skip_block_comment("/*".bytes, "*/".bytes, false) match
+                Ok(true) -> continue
+                Ok(false) -> break
+                Err(span) -> return Err(error(Span(span.start, span.start + 2), "this comment is never closed"))
+        Ok(())
+
+    // A keyword, as a whole word, after any whitespace.
+    word(*self, w: string) -> bool
+        self.ws().is_ok() && self.s.accept_word(w.bytes, is_ident_cont)
+
+    since(self, start: usize) -> Span = Span(start, self.s.offset)
+
+    unexpected(self, want: string) -> Diagnostic
+        val here = self.token_span()
+        expected(here, want, found_at(self.src, here))
+
+    // The span of what the cursor is on: a word, or one byte.
+    token_span(self) -> Span
+        var t = self.s
+        val from = t.offset
+        if t.read_ident(is_ident_start, is_ident_cont).is_none() then t.bump()
+        Span(from, t.offset)
+
+    expect(*self, c: u8, what: string) -> Result[unit, Diagnostic]
+        self.ws()?
+        if self.s.accept(c) then Ok(()) else Err(self.unexpected(what))
+
+    ident(*self) -> Result[(string, Span), Diagnostic]
+        self.ws()?
+        self.s.read_ident(is_ident_start, is_ident_cont) match
+            Some(span) -> Ok((text_of(self.src, span), span))
+            None -> Err(self.unexpected("a name"))
+
+    // `a.b.c`, with no spaces around the dots.
+    full_ident(*self) -> Result[(string, Span), Diagnostic]
+        val first = self.ident()?
+        val start = first.1.start
+        while self.s.peek() == Some(u8('.'))
+            self.s.bump()
+            self.s.read_ident(is_ident_start, is_ident_cont) match
+                Some(_) -> ()
+                None -> return Err(self.unexpected("a name after `.`"))
+        val span = self.since(start)
+        Ok((text_of(self.src, span), span))
+end Parser
+
+private[schema] text_of(src: Source, span: Span) -> string = sysl.text.from_utf8_unchecked(src.text(span))
+
+// What a proto2 construct is called in the refusal, and the construct it belongs to.
+private[schema] refused(span: Span, what: string, family: string) -> Diagnostic =
+    error(span, s"$what is proto2-only and is not supported").with_note(s"$family exist in proto2, and this reader reads proto3")
+
+private[schema] syntax(p: *Parser) -> Result[unit, Diagnostic]
+    p.expect(u8('='), "`=` after `syntax`")?
+    p.ws()?
+    val at = p.s.offset
+    val value = string_lit(p)?
+    if value != "proto3" then
+        return Err(error(p.since(at), s"`syntax = \"$value\"` is not supported")
+            .with_note("this reader reads proto3 files"))
+    p.expect(u8(';'), "`;` after the syntax")
+
+private[schema] import_decl(p: *Parser, start: usize) -> Result[Import, Diagnostic]
+    val public = p.word("public")
+    val is_weak = !public && p.word("weak")
+    p.ws()?
+    val path = string_lit(p)?
+    p.expect(u8(';'), "`;` after the import")?
+    Ok(Import(path, public, is_weak, p.since(start)))
+
+// A string literal, and any that follow it: adjacent literals are one, as in C.
+private[schema] string_lit(p: *Parser) -> Result[string, Diagnostic]
+    var b = str_builder()
+    var any = false
+    loop
+        p.ws()?
+        val q = p.s.peek()
+        if q != Some(u8('"')) && q != Some(u8('\'')) then break
+        read_quoted(&p.s, q.unwrap()) match
+            Ok(text) -> b.push(text)
+            Err(e) -> return Err(error(where(e), s"this string literal is ${e}"))
+        any = true
+    if !any then return Err(p.unexpected("a string literal"))
+    Ok(b.finish())
+
+// An integer literal: decimal, `0x` hexadecimal, or `0` octal as in C — which `read_integer` does not
+// do, since a leading zero is decimal there.
+private[schema] int_lit(p: *Parser) -> Result[ulong, Diagnostic]
+    p.ws()?
+    val start = p.s.offset
+    val got =
+        if p.s.peek() == Some(u8('0')) && p.s.peek_at(1).map(is_octal_digit).unwrap_or(false) then
+            p.s.bump()
+            read_digits(&p.s, 8)
+        elif p.s.peek().map(is_digit).unwrap_or(false) then
+            read_integer(&p.s)
+        else
+            return Err(p.unexpected("a number"))
+    got match
+        Ok(v) ->
+            if p.s.peek().map(is_ident_cont).unwrap_or(false) then
+                return Err(error(p.since(start), "this number runs into the name after it"))
+            Ok(v)
+        Err(e) -> Err(error(where(e), s"this number is ${e}"))
+
+// A number with an optional sign, as an option value, an enum value or a reserved range.
+private[schema] signed_lit(p: *Parser) -> Result[(bool, ulong, Span), Diagnostic]
+    p.ws()?
+    val start = p.s.offset
+    val negative = p.s.accept(u8('-'))
+    if !negative then p.s.accept(u8('+'))
+    val v = int_lit(p)?
+    Ok((negative, v, p.since(start)))
+
+private[schema] option_decl(p: *Parser, start: usize) -> Result[OptionDecl, Diagnostic]
+    val o = option_body(p, start)?
+    p.expect(u8(';'), "`;` after the option")?
+    Ok(o)
+
+// `name = value`, the part an `option` line and a field's bracketed list share.
+private[schema] option_body(p: *Parser, start: usize) -> Result[OptionDecl, Diagnostic]
+    val name = option_name(p)?
+    p.expect(u8('='), "`=` after the option's name")?
+    val value = constant(p)?
+    Ok(OptionDecl(name, value, p.since(start)))
+
+private[schema] option_name(p: *Parser) -> Result[string, Diagnostic]
+    var b = str_builder()
+    loop
+        p.ws()?
+        if p.s.accept(u8('(')) then
+            p.ws()?
+            val dot = p.s.accept(u8('.'))
+            val inner = p.full_ident()?.0
+            p.expect(u8(')'), "`)` after the extension's name")?
+            b.push("(")
+            if dot then b.push(".")
+            b.push(inner)
+            b.push(")")
+        else
+            b.push(p.ident()?.0)
+        p.ws()?
+        if !p.s.accept(u8('.')) then break
+        b.push(".")
+    Ok(b.finish())
+
+private[schema] constant(p: *Parser) -> Result[Constant, Diagnostic]
+    p.ws()?
+    val start = p.s.offset
+    val c = p.s.peek() match
+        Some(c) -> c
+        None -> return Err(p.unexpected("a value"))
+    if c == u8('"') || c == u8('\'') then return Ok(Text(string_lit(p)?))
+    if c == u8('{') then return Ok(Aggregate(aggregate(p)?))
+    if is_ident_start(c) then return Ok(Ident(p.full_ident()?.0))
+    val negative = c == u8('-')
+    if negative || c == u8('+') then
+        p.s.bump()
+        p.ws()?
+        // `-inf` and `-nan` are numbers too.
+        if p.s.peek().map(is_ident_start).unwrap_or(false) then
+            val word = p.ident()?.0
+            return Ok(Float(if negative then "-" + word else word))
+    val digits_at = p.s.offset
+    read_number(&p.s) match
+        Ok(Int(v)) -> Ok(Int(v, negative))
+        Ok(_) -> Ok(Float(text_of(p.src, p.since(start))))
+        Err(e) ->
+            if p.s.offset == digits_at then return Err(p.unexpected("a value"))
+            Err(error(where(e), s"this number is ${e}"))
+end constant
+
+// An option's value written as a message in text format, `{ a: 1 b: "}" }`, kept as its text. Its
+// braces are counted outside its string literals only, which is why this is not `skip_balanced`.
+private[schema] aggregate(p: *Parser) -> Result[string, Diagnostic]
+    val start = p.s.offset
+    var depth = 0
+    loop
+        val c = p.s.peek() match
+            Some(c) -> c
+            None -> return Err(error(Span(start, start + 1), "this `{` is never closed"))
+        if c == u8('"') || c == u8('\'') then
+            read_quoted(&p.s, c) match
+                Ok(_) -> ()
+                Err(e) -> return Err(error(where(e), s"this string literal is ${e}"))
+        elif c == u8('#') then
+            p.s.skip_to_line_end()
+        else
+            p.s.bump()
+            if c == u8('{') then
+                depth += 1
+            elif c == u8('}') then
+                depth -= 1
+                if depth == 0 then break
+    Ok(text_of(p.src, p.since(start)))
+
+// The bracketed options after a field or an enum value.
+private[schema] bracket_options(p: *Parser) -> Result[Buf[OptionDecl], Diagnostic]
+    val out: Buf[OptionDecl] = buf()
+    p.ws()?
+    if !p.s.accept(u8('[')) then return Ok(out)
+    loop
+        p.ws()?
+        out.push(option_body(p, p.s.offset)?)
+        p.ws()?
+        if p.s.accept(u8(']')) then break
+        p.expect(u8(','), "`,` or `]` in the options")?
+    Ok(out)
+
+private[schema] message(p: *Parser, start: usize) -> Result[MessageDecl, Diagnostic]
+    val name = p.ident()?
+    val m = MessageDecl(name.0, "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), false, name.1)
+    p.expect(u8('{'), "`{` to open the message")?
+    loop
+        p.ws()?
+        val at = p.s.offset
+        if p.s.accept(u8('}')) then break
+        if p.s.at_end() then return Err(error(Span(start, start + 7), "this message is never closed"))
+        if p.s.accept(u8(';')) then continue
+        if p.word("message") then
+            m.messages.push(message(p, at)?)
+        elif p.word("enum") then
+            m.enums.push(enum_decl(p, at)?)
+        elif p.word("option") then
+            m.options.push(option_decl(p, at)?)
+        elif p.word("oneof") then
+            oneof(p, m, at)?
+        elif p.word("map") then
+            map_field(p, m, at)?
+        elif p.word("reserved") then
+            reserved(p, m.reserved, m.reserved_names, max_field_number)?
+        elif p.word("extensions") then
+            return Err(refused(p.since(at), "`extensions`", "extension ranges"))
+        elif p.word("extend") then
+            return Err(refused(p.since(at), "`extend`", "extensions"))
+        elif p.word("required") then
+            return Err(refused(p.since(at), "`required`", "required fields"))
+        else
+            m.fields.push(field(p, m, None, at)?)
+    Ok(m)
+end message
+
+/** The largest field number, 2^29 - 1. */
+const max_field_number: long = 536_870_911
+
+// A field, with the cursor after its label if it has one.
+private[schema] field(p: *Parser, m: MessageDecl, in_oneof: Option[usize], start: usize) -> Result[FieldDecl, Diagnostic]
+    var label = Label.Implicit
+    if in_oneof.is_none() then
+        if p.word("repeated") then
+            label = Repeated
+        elif p.word("optional") then
+            label = Optional
+    p.ws()?
+    if p.word("group") then return Err(refused(p.since(start), "a group", "groups"))
+    val ty = type_ref(p)?
+    val name = p.ident()?
+    val number = field_number(p)?
+    val options = bracket_options(p)?
+    p.expect(u8(';'), "`;` after the field")?
+    Ok(FieldDecl(name.0, number, label, ty, in_oneof, json_of(name.0, options), false, options, p.since(start)))
+
+private[schema] json_of(name: string, options: Buf[OptionDecl]) -> string
+    for o in options
+        if o.name == "json_name" then
+            o.value match
+                Text(v) -> return v
+                _ -> ()
+    json_name_of(name)
+
+// `= number`, checked against the range a field number may have.
+private[schema] field_number(p: *Parser) -> Result[u32, Diagnostic]
+    p.expect(u8('='), "`=` and the field's number")?
+    p.ws()?
+    val at = p.s.offset
+    val n = int_lit(p)?
+    val span = p.since(at)
+    if n == 0 || n > ulong(max_field_number) then
+        return Err(error(span, s"field number $n is out of range").with_note("a field number is 1 to 536,870,911"))
+    if n >= 19000 && n <= 19999 then
+        return Err(error(span, s"field number $n is reserved for protobuf's own use").with_note("19,000 to 19,999 are reserved"))
+    Ok(u32(n))
+
+private[schema] type_ref(p: *Parser) -> Result[TypeRef, Diagnostic]
+    p.ws()?
+    val start = p.s.offset
+    val dot = p.s.accept(u8('.'))
+    val name = p.full_ident()?.0
+    if !dot then
+        scalar_named(name) match
+            Some(s) -> return Ok(ScalarType(s))
+            None -> ()
+    Ok(Named(text_of(p.src, p.since(start)), "", Unresolved))
+
+private[schema] oneof(p: *Parser, m: MessageDecl, start: usize) -> Result[unit, Diagnostic]
+    val name = p.ident()?
+    val index = m.oneofs.len()
+    val options: Buf[OptionDecl] = buf()
+    m.oneofs.push(OneofDecl(name.0, options, name.1))
+    p.expect(u8('{'), "`{` to open the oneof")?
+    var count = 0
+    loop
+        p.ws()?
+        val at = p.s.offset
+        if p.s.accept(u8('}')) then break
+        if p.s.at_end() then return Err(error(name.1, "this oneof is never closed"))
+        if p.s.accept(u8(';')) then continue
+        if p.word("option") then
+            options.push(option_decl(p, at)?)
+        elif p.word("repeated") || p.word("optional") || p.word("required") then
+            return Err(error(p.since(at), "a oneof's fields take no label").with_note("a oneof member is already optional, and cannot be repeated"))
+        elif p.word("map") then
+            return Err(error(p.since(at), "a map cannot be a oneof member"))
+        else
+            m.fields.push(field(p, m, Some(index), at)?)
+            count += 1
+    if count == 0 then return Err(error(name.1, s"oneof `${name.0}` has no fields"))
+    Ok(())
+
+// `map<K, V> name = n;`, which is a repeated field of a nested entry message.
+private[schema] map_field(p: *Parser, m: MessageDecl, start: usize) -> Result[unit, Diagnostic]
+    p.expect(u8('<'), "`<` after `map`")?
+    p.ws()?
+    val key_at = p.s.offset
+    val key = type_ref(p)?
+    val key_span = p.since(key_at)
+    val key_scalar = key match
+        ScalarType(s) -> if s.keyable() then s else return Err(not_a_key(key_span, s.keyword()))
+        Named(written, _, _) -> return Err(not_a_key(key_span, written))
+    p.expect(u8(','), "`,` between the map's key and value types")?
+    val value = type_ref(p)?
+    p.expect(u8('>'), "`>` to close the map's types")?
+    val name = p.ident()?
+    val number = field_number(p)?
+    val options = bracket_options(p)?
+    p.expect(u8(';'), "`;` after the field")?
+    val span = p.since(start)
+    val entry_name = entry_name_of(name.0)
+    val entry_fields: Buf[FieldDecl] = buf()
+    entry_fields.push(FieldDecl("key", 1, Implicit, ScalarType(key_scalar), None, "key", false, buf(), span))
+    entry_fields.push(FieldDecl("value", 2, Implicit, value, None, "value", false, buf(), span))
+    m.messages.push(MessageDecl(entry_name, "", entry_fields, buf(), buf(), buf(), buf(), buf(), buf(), true, span))
+    m.fields.push(FieldDecl(name.0, number, Repeated, Named(entry_name, "", Unresolved), None, json_of(name.0, options), true,
+                            options, span))
+    Ok(())
+end map_field
+
+private[schema] not_a_key(span: Span, what: string) -> Diagnostic =
+    error(span, s"`$what` cannot be a map's key").with_note("a key is an integral type, `bool` or `string`")
+
+/** protoc's name for a map field's entry message: the field's name in camel case, capitalised, with
+ * `Entry` after it. */
+entry_name_of(field: string) -> string
+    val out: Buf[u8] = buf()
+    var upper = true
+    for c in field.bytes
+        if c == u8('_') then
+            upper = true
+        elif upper then
+            out.push(if c >= u8('a') && c <= u8('z') then c - 32 else c)
+            upper = false
+        else
+            out.push(c)
+    out.extend("Entry".bytes)
+    from_bytes(out)
+
+// `reserved 2, 15, 9 to 11;` or `reserved "foo", "bar";`.
+private[schema] reserved(p: *Parser, ranges: Buf[Range], names: Buf[string], max: long) -> Result[unit, Diagnostic]
+    p.ws()?
+    if p.s.peek() == Some(u8('"')) || p.s.peek() == Some(u8('\'')) then
+        loop
+            names.push(string_lit(p)?)
+            p.ws()?
+            if !p.s.accept(u8(',')) then break
+    else
+        loop
+            val lo = signed_lit(p)?
+            val start = value_of(lo)
+            var end = start
+            if p.word("to") then
+                if p.word("max") then
+                    end = max
+                else
+                    end = value_of(signed_lit(p)?)
+            val span = Span(lo.2.start, p.s.offset)
+            if end < start then return Err(error(span, s"this range runs backwards, from $start down to $end"))
+            ranges.push(Range(start, end, span))
+            p.ws()?
+            if !p.s.accept(u8(',')) then break
+    p.expect(u8(';'), "`;` after the reserved list")
+
+private[schema] value_of(n: (bool, ulong, Span)) -> long = if n.0 then -long(n.1) else long(n.1)
+
+private[schema] enum_decl(p: *Parser, start: usize) -> Result[EnumDecl, Diagnostic]
+    val name = p.ident()?
+    val e = EnumDecl(name.0, "", buf(), buf(), buf(), buf(), name.1)
+    p.expect(u8('{'), "`{` to open the enum")?
+    loop
+        p.ws()?
+        val at = p.s.offset
+        if p.s.accept(u8('}')) then break
+        if p.s.at_end() then return Err(error(name.1, "this enum is never closed"))
+        if p.s.accept(u8(';')) then continue
+        if p.word("option") then
+            e.options.push(option_decl(p, at)?)
+        elif p.word("reserved") then
+            reserved(p, e.reserved, e.reserved_names, 2147483647)?
+        else
+            val value = p.ident()?
+            p.expect(u8('='), "`=` and the value's number")?
+            val n = signed_lit(p)?
+            val v = value_of(n)
+            if v < -2147483648 || v > 2147483647 then
+                return Err(error(n.2, s"enum value $v does not fit an int32"))
+            val options = bracket_options(p)?
+            p.expect(u8(';'), "`;` after the enum value")?
+            e.values.push(EnumValue(value.0, i32(v), options, value.1))
+    if e.values.is_empty() then return Err(error(name.1, s"enum `${name.0}` has no values"))
+    Ok(e)
+end enum_decl
+
+// A service is read so that a file holding one is accepted; nothing is generated for it.
+private[schema] service(p: *Parser, start: usize) -> Result[ServiceDecl, Diagnostic]
+    val name = p.ident()?
+    p.ws()?
+    p.s.skip_balanced(u8('{'), u8('}')) match
+        Ok(_) -> Ok(ServiceDecl(name.0, name.1))
+        Err(span) ->
+            if span.is_empty() then Err(p.unexpected("`{` to open the service"))
+            else Err(error(name.1, "this service is never closed"))

@@ -1,0 +1,13 @@
+// The gate's proof that the runtime encodes and decodes where there is no operating system and no
+// heap: a program that writes a message into static storage and reads it back, built as an archive
+// for freestanding CPU families. A library build alone proves too little, since it never checks the
+// body of a generic function nothing has instantiated.
+
+package {
+  name    = "portable"
+  version = "0.0.1"
+}
+
+dependencies {
+  protobuf { workspace = true }
+}

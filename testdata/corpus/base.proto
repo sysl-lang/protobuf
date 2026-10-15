@@ -1,0 +1,15 @@
+// Imported by nested.proto, and publicly by relay.proto.
+syntax = "proto3";
+
+package corpus.base;
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_OK = 1;
+}
+
+message Shared {
+  string note = 1;
+  Status status = 2;
+  repeated bytes chunks = 3;
+}

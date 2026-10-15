@@ -1,0 +1,402 @@
+module sh.sysl.protobuf.gen
+@tests
+@requires(heap, os)
+
+import sh.sysl.protobuf.{DecodeError, Message, reader}
+import sh.sysl.protobuf.testdata.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_temp_dir, read_bytes, read_text, remove_dir_all, write_bytes, write_text}
+import sysl.process.{Stdio, capture, run}
+import sysl.testing.skip
+import sysl.text.{Search, split}
+
+// protoc as the encoding oracle. Each case is a value built in the generated sysl and the same value
+// in protobuf's text format: protoc encodes the text, and the two encodings must be the same bytes;
+// the generated `decode` must read protoc's bytes back into the value; and `encoded_size` must be the
+// length. Where protoc's own order is not fixed — a map's entries come out in its hash order — the
+// two encodings are compared through `protoc --decode`, which prints a map sorted.
+
+val PROTOC: string = "/opt/homebrew/bin/protoc"
+
+private need_protoc()
+    if !exists(PROTOC) then skip(f"$PROTOC is not installed (brew install protobuf)")
+
+// A scratch directory for one test.
+private scratch(name: string) -> string = make_temp_dir(f"protobuf-$name-").unwrap()
+
+// protoc's encoding of `text`, a `sh.sysl.protobuf.testdata.<message>` in text format.
+private protoc_encode(dir: string, message: string, text: string) -> Buf[u8] =
+    protoc_encode_in(dir, "scalars.proto", "sh.sysl.protobuf.testdata." + message, text)
+
+// protoc's encoding of `text`, a `full` message of `file` under testdata.
+private protoc_encode_in(dir: string, file: string, full: string, text: string) -> Buf[u8]
+    val input = f"$dir/in.txt"
+    val output = f"$dir/out.bin"
+    write_text(input, text).unwrap()
+    val ran = run(PROTOC, [f"--encode=$full", "-I", "testdata", file],
+                  stdin = Stdio.FromPath(input), stdout = Stdio.ToPath(output)).unwrap()
+    if !ran.ok() then panic(f"protoc refused to encode a $full:\n$text")
+    val got: Buf[u8] = buf()
+    got.extend(read_bytes(output).unwrap())
+    got
+
+// protoc's reading of `bytes` as a `<message>`, in text format.
+private protoc_decode(dir: string, message: string, bytes: []const u8) -> string
+    val input = f"$dir/in.bin"
+    val output = f"$dir/out.txt"
+    write_bytes(input, bytes).unwrap()
+    val ran = run(PROTOC, [f"--decode=sh.sysl.protobuf.testdata.$message", "-I", "testdata", "scalars.proto"],
+                  stdin = Stdio.FromPath(input), stdout = Stdio.ToPath(output)).unwrap()
+    if !ran.ok() then panic(f"protoc could not decode the bytes as a $message")
+    read_text(output).unwrap()
+
+private hex(b: []const u8) -> string
+    var s = ""
+    for x in b
+        s = s + f"{x:02x} "
+    s
+
+// The three checks, for one message type: the same bytes, the same value back, the same size.
+private agrees[M: Message + Eq + Display](dir: string, message: string, value: M, text: string)
+    val theirs = protoc_encode(dir, message, text)
+    val ours = value.to_bytes()
+    if ours != theirs then
+        panic(f"$message: our bytes and protoc's differ\n  ours:    ${hex(ours.view())}\n  protoc:  ${hex(theirs.view())}\n  value:   $value\n  text:    $text")
+    assert_eq(value.encoded_size(), ours.len())
+    M.decode(theirs.view()) match
+        Ok(back) -> if back != value then panic(f"$message: protoc's bytes decoded to\n  $back\nnot\n  $value")
+        Err(e) -> panic(f"$message: protoc's bytes did not decode: $e")
+
+private bytes_of(xs: []const u8) -> Buf[u8]
+    val b: Buf[u8] = buf()
+    b.extend(xs)
+    b
+
+@test("protoc: every scalar type at zero, one, minus one, its maximum and its minimum")
+scalar_edges()
+    need_protoc()
+    val dir = scratch("scalars")
+    agrees(dir, "Scalars", Scalars.empty(), "")
+
+    var max = Scalars.empty()
+    max.f_double = 1.7976931348623157e308
+    max.f_float = 3.4028235e38f32
+    max.f_int32 = 2147483647
+    max.f_int64 = 9223372036854775807
+    max.f_uint32 = 4294967295
+    max.f_uint64 = 18446744073709551615
+    max.f_sint32 = 2147483647
+    max.f_sint64 = 9223372036854775807
+    max.f_fixed32 = 4294967295
+    max.f_fixed64 = 18446744073709551615
+    max.f_sfixed32 = 2147483647
+    max.f_sfixed64 = 9223372036854775807
+    max.f_bool = true
+    max.f_string = "héllo ✓"
+    max.f_bytes = bytes_of([0, 255, 10])
+    agrees(dir, "Scalars", max, raw"""
+        f_double: 1.7976931348623157e308 f_float: 3.4028235e38 f_int32: 2147483647
+        f_int64: 9223372036854775807 f_uint32: 4294967295 f_uint64: 18446744073709551615
+        f_sint32: 2147483647 f_sint64: 9223372036854775807 f_fixed32: 4294967295
+        f_fixed64: 18446744073709551615 f_sfixed32: 2147483647 f_sfixed64: 9223372036854775807
+        f_bool: true f_string: "h\303\251llo \342\234\223" f_bytes: "\000\377\n"
+        """)
+
+    var min = Scalars.empty()
+    min.f_double = -0.0
+    min.f_float = -1.5f32
+    min.f_int32 = -2147483648
+    min.f_int64 = -9223372036854775808
+    min.f_sint32 = -2147483648
+    min.f_sint64 = -9223372036854775808
+    min.f_sfixed32 = -2147483648
+    min.f_sfixed64 = -9223372036854775808
+    min.f_string = "a"
+    agrees(dir, "Scalars", min, """
+        f_double: -0 f_float: -1.5 f_int32: -2147483648 f_int64: -9223372036854775808
+        f_sint32: -2147483648 f_sint64: -9223372036854775808 f_sfixed32: -2147483648
+        f_sfixed64: -9223372036854775808 f_string: "a"
+        """)
+
+    // Minus one: a negative int32 is a ten-byte varint, a sint32 one byte.
+    var minus = Scalars.empty()
+    minus.f_double = -1.0
+    minus.f_float = 0.1f32
+    minus.f_int32 = -1
+    minus.f_int64 = -1
+    minus.f_sint32 = -1
+    minus.f_sint64 = -1
+    minus.f_sfixed32 = -1
+    minus.f_sfixed64 = -1
+    minus.f_uint32 = 1
+    minus.f_uint64 = 1
+    minus.f_fixed32 = 1
+    minus.f_fixed64 = 1
+    agrees(dir, "Scalars", minus, """
+        f_double: -1 f_float: 0.1 f_int32: -1 f_int64: -1 f_sint32: -1 f_sint64: -1 f_sfixed32: -1
+        f_sfixed64: -1 f_uint32: 1 f_uint64: 1 f_fixed32: 1 f_fixed64: 1
+        """)
+    assert_eq(minus.to_bytes().view()[14..<25], [0x18u8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01][..])
+
+    var big = Scalars.empty()
+    big.f_double = infinity
+    big.f_float = -f32.infinity
+    big.f_int32 = 300
+    big.f_uint64 = 1 << 63
+    agrees(dir, "Scalars", big, "f_double: inf f_float: -inf f_int32: 300 f_uint64: 9223372036854775808")
+    remove_dir_all(dir).unwrap()
+
+@test("protoc: repeated numbers packed and unpacked, strings, bytes, enums and messages")
+repeats()
+    need_protoc()
+    val dir = scratch("repeats")
+    agrees(dir, "Repeats", Repeats.empty(), "")
+    var r = Repeats.empty()
+    for v in [0i32, 1, -1, 300, -2147483648]
+        r.packed_int32.push(v)
+        r.unpacked_int32.push(v)
+    for v in [0i64, -1, 1, -9223372036854775808]
+        r.packed_sint64.push(v)
+    for v in [0.0, -0.0, 2.5]
+        r.packed_double.push(v)
+    for v in [7u32, 0, 4294967295]
+        r.packed_fixed32.push(v)
+    for v in [true, false, true]
+        r.packed_bool.push(v)
+    for v in [18446744073709551615u64, 0, 128]
+        r.packed_uint64.push(v)
+    r.packed_float.push(1.25f32)
+    r.packed_sfixed64.push(-2)
+    for v in ["", "one", "two"]
+        r.strings.push(v)
+    r.blobs.push(bytes_of([]))
+    r.blobs.push(bytes_of([1, 2]))
+    r.colors.push(Color.Red)
+    r.colors.push(Color.Blue)
+    r.colors.push(Color.Unspecified)
+    r.colors.push(Color.Unrecognized(77))
+    var inner = Scalars.empty()
+    inner.f_sint32 = -9
+    r.nested.push(inner)
+    r.nested.push(Scalars.empty())
+    agrees(dir, "Repeats", r, raw"""
+        packed_int32: [0, 1, -1, 300, -2147483648] unpacked_int32: [0, 1, -1, 300, -2147483648]
+        packed_sint64: [0, -1, 1, -9223372036854775808] packed_double: [0, -0, 2.5]
+        packed_fixed32: [7, 0, 4294967295] packed_bool: [true, false, true]
+        packed_uint64: [18446744073709551615, 0, 128] packed_float: 1.25 packed_sfixed64: -2
+        strings: ["", "one", "two"] blobs: ["", "\001\002"]
+        colors: [COLOR_RED, COLOR_BLUE, COLOR_UNSPECIFIED, 77]
+        nested { f_sint32: -9 } nested { }
+        """)
+    remove_dir_all(dir).unwrap()
+
+@test("protoc: a oneof's every member, written even at its default; optional fields; enums and aliases")
+oneofs_and_optionals()
+    need_protoc()
+    val dir = scratch("oneofs")
+    var a = Shapes.empty()
+    a.shape = Some(ShapesShape.Radius(0.0))
+    agrees(dir, "Shapes", a, "radius: 0")
+    var b = Shapes.empty()
+    b.shape = Some(ShapesShape.Corner(ShapesPoint(-1, 2)))
+    b.between = 9
+    agrees(dir, "Shapes", b, "corner { x: -1 y: 2 } between: 9")
+    var c = Shapes.empty()
+    c.shape = Some(ShapesShape.Label(""))
+    c.origin = Some(ShapesPoint.empty())
+    agrees(dir, "Shapes", c, "label: \"\" origin { }")
+    var d = Shapes.empty()
+    d.shape = Some(ShapesShape.Fill(Color.Unspecified))
+    d.maybe = Some(0)
+    d.maybe_color = Some(Color.Unspecified)
+    d.status = ShapesStatus.Started
+    d.color = Color.Blue
+    agrees(dir, "Shapes", d, "fill: COLOR_UNSPECIFIED maybe: 0 maybe_color: COLOR_UNSPECIFIED status: STATUS_RUNNING color: COLOR_BLUE")
+    // A number the enum does not name arrives, is kept, and goes back out unchanged.
+    var e = Shapes.empty()
+    e.color = Color.Unrecognized(-77)
+    e.status = ShapesStatus.Unrecognized(5)
+    agrees(dir, "Shapes", e, "color: -77 status: 5")
+    remove_dir_all(dir).unwrap()
+
+@test("protoc: maps, one entry exactly and several through protoc's sorted reading")
+maps()
+    need_protoc()
+    val dir = scratch("maps")
+    var one = Shapes.empty()
+    one.counts.push(ShapesCountsEntry("", 0))
+    agrees(dir, "Shapes", one, "counts { key: \"\" value: 0 }")
+    var pt = Shapes.empty()
+    pt.points.push(ShapesPointsEntry(-4, ShapesPoint.empty()))
+    agrees(dir, "Shapes", pt, "points { key: -4 value { } }")
+    var many = Shapes.empty()
+    for (k, v) in [("b", 2i32), ("a", 1), ("c", -3)]
+        many.counts.push(ShapesCountsEntry(k, v))
+    many.points.push(ShapesPointsEntry(7, ShapesPoint(1, 1)))
+    many.points.push(ShapesPointsEntry(3, ShapesPoint(0, -5)))
+    val text = "counts { key: \"b\" value: 2 } counts { key: \"a\" value: 1 } counts { key: \"c\" value: -3 } points { key: 7 value { x: 1 y: 1 } } points { key: 3 value { y: -5 } }"
+    val theirs = protoc_encode(dir, "Shapes", text)
+    val ours = many.to_bytes()
+    assert_eq(ours.len(), theirs.len())
+    assert_eq(protoc_decode(dir, "Shapes", ours.view()), protoc_decode(dir, "Shapes", theirs.view()))
+    // Read back, every entry protoc wrote is there, whatever order it wrote them in.
+    val back = Shapes.decode(theirs.view()).unwrap()
+    assert_eq(back.counts.len(), 3)
+    for want in many.counts
+        var found = false
+        for got in back.counts
+            if got == want then found = true
+        assert(found, f"$want is missing")
+    remove_dir_all(dir).unwrap()
+
+@test("protoc: fields a message does not know are skipped, of every wire type, and not kept")
+unknown_fields()
+    need_protoc()
+    val dir = scratch("unknown")
+    // Every field of a Scalars is unknown to a Nothing, and a Repeats's packed runs to a Keywords.
+    val all = protoc_encode(dir, "Scalars", "f_double: 1 f_float: 2 f_int32: -3 f_fixed64: 4 f_string: \"s\" f_bytes: \"b\" f_sint64: -5")
+    assert_eq(Nothing.decode(all.view()), Ok(Nothing()))
+    assert_eq(Nothing.decode(all.view()).unwrap().to_bytes().len(), 0)
+    // Keywords's field 1 is a string, so a Repeats's packed run arrives there as its bytes, and the
+    // fields Keywords does not have (6 and 7) are stepped over.
+    val mixed = protoc_encode(dir, "Repeats", "packed_int32: [97, 98] strings: \"x\" unpacked_int32: 5")
+    var want = Keywords.empty()
+    want.`type` = "ab"
+    assert_eq(Keywords.decode(mixed.view()), Ok(want))
+    // And a run whose bytes are not UTF-8 is refused at its length.
+    val bad = protoc_encode(dir, "Repeats", "packed_int32: [200, 300]")
+    assert_eq(Keywords.decode(bad.view()), Err(DecodeError.BadUtf8(1)))
+    remove_dir_all(dir).unwrap()
+
+@test("protoc: a message protoc wrote with a field twice is merged, and a truncated one is refused with its offset")
+merges_and_truncation()
+    need_protoc()
+    val dir = scratch("merge")
+    val first = protoc_encode(dir, "Shapes", "origin { x: 1 } between: 1")
+    val second = protoc_encode(dir, "Shapes", "origin { y: 2 } between: 2")
+    val both = first.copy()
+    both.extend(second.view())
+    val merged = Shapes.decode(both.view()).unwrap()
+    assert_eq(merged.origin, Some(ShapesPoint(1, 2)))
+    assert_eq(merged.between, 2)
+    val cut = protoc_encode(dir, "Scalars", "f_int64: -1")
+    assert_eq(Scalars.decode(cut.view()[0..<5]), Err(DecodeError.Truncated(5)))
+    remove_dir_all(dir).unwrap()
+
+// -- the generated code, compiled and run on its own ----------------------------------------------
+
+// A program over the corpus's generated modules: it builds a value of each root message, prints its
+// encoding in hex, and says whether decoding that gave the value back.
+val CORPUS_MAIN: string = """
+    import corpus.base.{Shared, Status}
+    import corpus.nested.*
+    import corpus.user.{Empty, Tree, TreeNamedEntry, User, UserStatusesEntry}
+    import corpus.relay.Relay
+    import sh.sysl.protobuf.Message
+    import sysl.buf.{Buf, buf}
+
+    hex(b: Buf[u8]) -> string
+        var s = ""
+        for x in b
+            s = s + f"{x:02x}"
+        s
+
+    main()
+        var inner = OuterMiddleInner.empty()
+        inner.shadowed = Some(OuterThing("s"))
+        inner.top = Some(Thing(-5))
+        inner.qualified = Some(OuterThing(""))
+        inner.kind = OuterKind.Minus
+        inner.shared = Some(Shared("n", Status.Ok, buf()))
+        var middle = OuterMiddle.empty()
+        middle.inner = Some(inner)
+        middle.inners.push(inner)
+        middle.by_name.push(OuterMiddleByNameEntry("k", inner))
+        var o = Outer.empty()
+        o.thing = Some(OuterThing("t"))
+        o.middle = Some(middle)
+        o.opt_number = Some(0)
+        o.opt_kind = Some(OuterKind.None)
+        o.choice = Some(OuterChoice.Text("hi"))
+        o.snake_case_name = 7
+        o.renamed = "r"
+        o.things.push(OuterThingsEntry(1, OuterThing("x")))
+        o.kinds.push(OuterKind.One)
+        o.kinds.push(OuterKind.Unrecognized(42))
+        o.status = Status.Ok
+        val bytes = o.to_bytes()
+        print(hex(bytes))
+        print(Outer.decode(bytes.view()) == Ok(o))
+
+        val chunks: Buf[Buf[u8]] = buf()
+        val chunk: Buf[u8] = buf()
+        chunk.push(7)
+        chunks.push(chunk)
+        var u = User.empty()
+        u.name = "u"
+        u.shared = Some(Shared("", Status.Unspecified, chunks))
+        u.relay = Some(Relay(Some(Shared("r", Status.Ok, buf()))))
+        u.nothing = Some(Empty())
+        u.statuses.push(UserStatusesEntry("a", Status.Ok))
+        var tree = Tree.empty()
+        tree.name = "root"
+        tree.kids.push(Tree("a", buf(), buf()))
+        tree.named.push(TreeNamedEntry("b", Tree("c", buf(), buf())))
+        u.tree = Some(tree)
+        val ub = u.to_bytes()
+        print(hex(ub))
+        print(User.decode(ub.view()) == Ok(u))
+    """
+
+val OUTER_TEXT: string = """
+    thing { label: "t" }
+    middle {
+      inner { shadowed { label: "s" } top { id: -5 } qualified { } kind: KIND_MINUS shared { note: "n" status: STATUS_OK } }
+      inners { shadowed { label: "s" } top { id: -5 } qualified { } kind: KIND_MINUS shared { note: "n" status: STATUS_OK } }
+      by_name { key: "k" value { shadowed { label: "s" } top { id: -5 } qualified { } kind: KIND_MINUS shared { note: "n" status: STATUS_OK } } }
+    }
+    opt_number: 0 opt_kind: KIND_NONE text: "hi" snake_case_name: 7 renamed: "r"
+    things { key: 1 value { label: "x" } } kinds: [KIND_ONE, 42] status: STATUS_OK
+    """
+
+val USER_TEXT: string = raw"""
+    name: "u" shared { chunks: "\007" } relay { shared { note: "r" status: STATUS_OK } } nothing { }
+    statuses { key: "a" value: STATUS_OK }
+    tree { name: "root" kids { name: "a" } named { key: "b" value { name: "c" } } }
+    """
+
+private hex_of(b: Buf[u8]) -> string
+    var s = ""
+    for x in b
+        s = s + f"{x:02x}"
+    s
+
+@test("generated: the corpus, four files in three packages, builds as a program of its own and agrees with protoc")
+generated_code_runs()
+    need_protoc()
+    val here = sysl.fs.current_dir().unwrap()
+    val dir = scratch("program")
+    write_text(f"$dir/package.hocon", s"package {\n  name = \"probe\"\n  version = \"0.0.1\"\n}\n\ndependencies {\n  protobuf { path = \"$here\" }\n}\n").unwrap()
+    val made = run_cli(["-I", "testdata", "--out", dir, "corpus/base.proto", "corpus/relay.proto", "corpus/nested.proto",
+                        "corpus/user.proto"])
+    if made.status != 0 then panic(f"protoc-sysl failed:\n${made.text}")
+    write_text(f"$dir/main.sysl", CORPUS_MAIN).unwrap()
+    val ran = capture(sysl.testing.compiler(), ["run", dir], stderr = true).unwrap()
+    if !ran.status.ok() then panic(f"the generated program did not build or run:\n${ran.text}${ran.err.unwrap_or("")}")
+    val lines = split(ran.text.trim(), "\n")
+    assert_eq(lines.len, 4)
+    assert_eq(lines[0], hex_of(protoc_encode_in(dir, "corpus/nested.proto", "corpus.nested.Outer", OUTER_TEXT)))
+    assert_eq(lines[1], "true")
+    assert_eq(lines[2], hex_of(protoc_encode_in(dir, "corpus/user.proto", "corpus.user.User", USER_TEXT)))
+    assert_eq(lines[3], "true")
+    remove_dir_all(dir).unwrap()
+
+@test("generated: the checked-in example is exactly what the generator writes today")
+checked_in_example()
+    val schema = sh.sysl.protobuf.schema.load(["scalars.proto"], ["testdata"]).unwrap()
+    val file = generate(schema, "scalars.proto").unwrap()
+    assert_eq(file.path, "sh/sysl/protobuf/testdata/scalars.sysl")
+    val checked_in = read_text(file.path).unwrap()
+    if checked_in != file.text then
+        panic("sh/sysl/protobuf/testdata/scalars.sysl differs from the generator's output — run `protoc-sysl -I testdata --out . testdata/scalars.proto`")
+    assert_eq(run_cli(["-I", "testdata", "--out", ".", "--check", "testdata/scalars.proto"]), Outcome("", 0))

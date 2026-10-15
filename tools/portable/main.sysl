@@ -1,0 +1,40 @@
+// Encodes a reading — a sensor id, a signed offset, a temperature and a packed run of samples — into a
+// buffer on the stack and reads it back, then does the same with a generated message, with no heap and
+// no operating system underneath.
+
+import sh.sysl.protobuf.{Codec, Double, Fixed32, Message, Output, SInt64, UInt32, reader, slice_output}
+import sh.sysl.protobuf.testdata.ShapesPoint
+
+@export("main")
+probe() -> i32
+    var store: [64]u8 = [0; 64]
+    var out = slice_output(store[..])
+    val samples: [3]u32 = [7, 300, 70000]
+    if UInt32.field(&out, 1, 42).is_err() then return 1
+    if SInt64.field(&out, 2, -5).is_err() then return 2
+    if Double.field(&out, 3, 21.5).is_err() then return 3
+    if Fixed32.packed(&out, 4, samples[..]).is_err() then return 4
+
+    var r = reader(out.written())
+    var sum: u64 = 0
+    while r.more()
+        val f = r.field() match
+            Ok(f) -> f
+            Err(_) -> return 5
+        f.number match
+            1 -> sum += u64(UInt32.read(&r, f) match
+                Ok(v) -> v
+                Err(_) -> return 6)
+            2 -> sum += u64(SInt64.read(&r, f) match
+                Ok(v) -> -v
+                Err(_) -> return 7)
+            _ ->
+                if r.skip(f).is_err() then return 8
+
+    var small: [8]u8 = [0; 8]
+    var point_out = slice_output(small[..])
+    if ShapesPoint(-3, 4).encode(&point_out).is_err() then return 9
+    val back = ShapesPoint.decode(point_out.written()) match
+        Ok(p) -> p
+        Err(_) -> return 10
+    i32(sum) + back.x + back.y

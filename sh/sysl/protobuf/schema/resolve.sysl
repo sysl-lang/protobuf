@@ -1,0 +1,300 @@
+module sh.sysl.protobuf.schema
+
+import sh.sysl.parsing.{Diagnostic, Span, error}
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.slices.contains
+import sysl.text.{Search, join}
+
+// Turning a set of files into a schema: every declaration given its fully qualified name, every
+// name checked for a clash, every field's type found, and the rules protoc enforces on numbers,
+// names and enums enforced here with a diagnostic at the place.
+
+/** What a fully qualified name stands for. */
+enum SymbolKind derives Display
+    Package
+    MessageSym
+    EnumSym
+    EnumValueSym
+    FieldSym
+    OneofSym
+    ServiceSym
+
+    /** Whether a dotted name may continue inside it. */
+    aggregate(self) -> bool = self == Package || self == MessageSym || self == EnumSym || self == ServiceSym
+
+    is_type(self) -> bool = self == MessageSym || self == EnumSym
+
+    noun(self) -> string = self match
+        Package -> "a package"
+        MessageSym -> "a message"
+        EnumSym -> "an enum"
+        EnumValueSym -> "an enum value"
+        FieldSym -> "a field"
+        OneofSym -> "a oneof"
+        ServiceSym -> "a service"
+end SymbolKind
+
+struct Symbol derives Eq, Display
+    kind: SymbolKind
+    file: usize
+    span: Span
+
+/** A set of files read and resolved: each file after everything it imports, and every name any of
+ * them declares. Names are kept as protoc writes them, with a leading dot: `.pkg.Outer.Inner`. */
+struct Schema
+    files: Buf[ProtoFile]
+    symbols: Map[string, Symbol]
+
+    /** The file of this name, if it was loaded. */
+    file(self, name: string) -> Option[ProtoFile]
+        for f in self.files
+            if f.name == name then return Some(f)
+        None
+
+    /** The message of this fully qualified name. */
+    message(self, full: string) -> Option[MessageDecl]
+        for f in self.files
+            find_message(f.messages, full) match
+                Some(m) -> return Some(m)
+                None -> ()
+        None
+
+    /** The enum of this fully qualified name. */
+    enum_named(self, full: string) -> Option[EnumDecl]
+        for f in self.files
+            for e in f.enums
+                if e.full == full then return Some(e)
+            find_enum(f.messages, full) match
+                Some(e) -> return Some(e)
+                None -> ()
+        None
+end Schema
+
+private[schema] find_message(ms: Buf[MessageDecl], full: string) -> Option[MessageDecl]
+    for m in ms
+        if m.full == full then return Some(m)
+        if full.starts_with(m.full + ".") then
+            find_message(m.messages, full) match
+                Some(found) -> return Some(found)
+                None -> ()
+    None
+
+private[schema] find_enum(ms: Buf[MessageDecl], full: string) -> Option[EnumDecl]
+    for m in ms
+        if full.starts_with(m.full + ".") then
+            for e in m.enums
+                if e.full == full then return Some(e)
+            find_enum(m.messages, full) match
+                Some(found) -> return Some(found)
+                None -> ()
+    None
+
+/** Resolves files already read, given in an order where each comes after what it imports. Every
+ * problem found is rendered against its own file, and all of them are answered together. */
+resolve(files: Buf[ProtoFile]) -> Result[Schema, string]
+    var r = Resolver(Schema(files, map()), buf())
+    for i in 0..<files.len()
+        index_file(&r, i)
+    if r.problems.is_empty() then
+        for i in 0..<files.len()
+            check_file(&r, i)
+    if r.problems.is_empty() then
+        for i in 0..<files.len()
+            resolve_file(&r, i)
+    if r.problems.is_empty() then Ok(r.schema) else Err(join(r.problems.view(), "\n"))
+
+private[schema] struct Resolver
+    schema: Schema
+    problems: Buf[string]
+
+    fail(*self, file: usize, d: Diagnostic)
+        self.problems.push(d.render(self.schema.files[file].src))
+
+    // Declares a name, or says where it was declared first.
+    declare(*self, name: string, sym: Symbol)
+        self.schema.symbols.get(name) match
+            Some(old) ->
+                if old.kind == Package && sym.kind == Package then return
+                val first = self.schema.files[old.file]
+                val loc = first.src.locate(old.span.start)
+                self.fail(sym.file, error(sym.span, s"`${bare(name)}` is already defined")
+                    .with_label(s"as ${old.kind.noun()} at ${first.name}:${loc}"))
+            None -> self.schema.symbols.put(name, sym)
+end Resolver
+
+/** A fully qualified name without its leading dot, as a person would write it. */
+bare(name: string) -> string = if name.starts_with(".") then name[1..<name.len] else name
+
+private[schema] index_file(r: *Resolver, i: usize)
+    val f = r.schema.files[i]
+    var scope = ""
+    if f.package != "" then
+        for part in sysl.text.split(f.package, ".")
+            scope = scope + "." + part
+            r.declare(scope, Symbol(Package, i, Span(0, 0)))
+    index_messages(r, i, f.messages, scope)
+    index_enums(r, i, f.enums, scope)
+    for s in f.services
+        r.declare(scope + "." + s.name, Symbol(ServiceSym, i, s.span))
+
+private[schema] index_messages(r: *Resolver, i: usize, ms: Buf[MessageDecl], scope: string)
+    for k in 0..<ms.len()
+        var m = ms[k]
+        m.full = scope + "." + m.name
+        ms.set(k, m)
+        r.declare(m.full, Symbol(MessageSym, i, m.span))
+        for f in m.fields
+            r.declare(m.full + "." + f.name, Symbol(FieldSym, i, f.span))
+        for o in m.oneofs
+            r.declare(m.full + "." + o.name, Symbol(OneofSym, i, o.span))
+        index_messages(r, i, m.messages, m.full)
+        index_enums(r, i, m.enums, m.full)
+
+// An enum's values are declared in the scope the enum is in, beside it, as in C++: two enums in one
+// scope may not both have a value called `UNKNOWN`.
+private[schema] index_enums(r: *Resolver, i: usize, es: Buf[EnumDecl], scope: string)
+    for k in 0..<es.len()
+        var e = es[k]
+        e.full = scope + "." + e.name
+        es.set(k, e)
+        r.declare(e.full, Symbol(EnumSym, i, e.span))
+        for v in e.values
+            r.declare(scope + "." + v.name, Symbol(EnumValueSym, i, v.span))
+
+// -- the rules on numbers and names ---------------------------------------------------------------
+
+private[schema] check_file(r: *Resolver, i: usize)
+    val f = r.schema.files[i]
+    for m in f.messages
+        check_message(r, i, m)
+    for e in f.enums
+        check_enum(r, i, e)
+
+private[schema] check_message(r: *Resolver, i: usize, m: MessageDecl)
+    val seen: Map[u32, FieldDecl] = map()
+    for f in m.fields
+        seen.get(f.number) match
+            Some(first) ->
+                r.fail(i, error(f.span, s"field number ${f.number} is already used by `${first.name}`"))
+            None -> seen.put(f.number, f)
+        for range in m.reserved
+            if long(f.number) >= range.start && long(f.number) <= range.end then
+                r.fail(i, error(f.span, s"field `${f.name}` uses number ${f.number}, which is reserved")
+                    .with_label("reserved here"))
+        for name in m.reserved_names
+            if name == f.name then r.fail(i, error(f.span, s"field name `${f.name}` is reserved"))
+    for a in 0..<m.reserved.len()
+        for b in a + 1..<m.reserved.len()
+            if m.reserved[a].start <= m.reserved[b].end && m.reserved[b].start <= m.reserved[a].end then
+                r.fail(i, error(m.reserved[b].span, "this reserved range overlaps an earlier one"))
+    val json: Map[string, FieldDecl] = map()
+    for f in m.fields
+        json.get(f.json_name) match
+            Some(first) ->
+                r.fail(i, error(f.span, s"field `${f.name}` has the JSON name `${f.json_name}`, which `${first.name}` has too"))
+            None -> json.put(f.json_name, f)
+    for n in m.messages
+        check_message(r, i, n)
+    for e in m.enums
+        check_enum(r, i, e)
+
+private[schema] check_enum(r: *Resolver, i: usize, e: EnumDecl)
+    val first = e.values[0]
+    if first.number != 0 then
+        r.fail(i, error(first.span, s"the first value of a proto3 enum must be 0, and `${first.name}` is ${first.number}")
+            .with_note("0 is the default an unset field reads as, so the enum has to name it"))
+    val seen: Map[i32, EnumValue] = map()
+    var aliased = false
+    for v in e.values
+        seen.get(v.number) match
+            Some(old) ->
+                aliased = true
+                if !e.allows_alias() then
+                    r.fail(i, error(v.span, s"`${v.name}` has the number ${v.number}, which `${old.name}` already has")
+                        .with_note("set `option allow_alias = true;` to let two names share a number"))
+            None -> seen.put(v.number, v)
+        for range in e.reserved
+            if long(v.number) >= range.start && long(v.number) <= range.end then
+                r.fail(i, error(v.span, s"`${v.name}` uses ${v.number}, which is reserved"))
+        for name in e.reserved_names
+            if name == v.name then r.fail(i, error(v.span, s"enum value name `${v.name}` is reserved"))
+    if e.allows_alias() && !aliased then
+        r.fail(i, error(e.span, s"enum `${e.name}` sets `allow_alias` but no two of its values share a number"))
+
+// -- types ----------------------------------------------------------------------------------------
+
+private[schema] resolve_file(r: *Resolver, i: usize)
+    val f = r.schema.files[i]
+    val visible = visible_files(r.schema, i)
+    for m in f.messages
+        resolve_message(r, i, visible, m)
+
+// The files whose names a file may use: itself, what it imports, and what those import publicly.
+private[schema] visible_files(s: Schema, i: usize) -> Buf[usize]
+    val out: Buf[usize] = buf()
+    out.push(i)
+    for imp in s.files[i].imports
+        add_public(s, imp.path, out)
+    out
+
+private[schema] add_public(s: Schema, name: string, out: Buf[usize])
+    for k in 0..<s.files.len()
+        if s.files[k].name == name then
+            for seen in out
+                if seen == k then return
+            out.push(k)
+            for imp in s.files[k].imports
+                if imp.public then add_public(s, imp.path, out)
+
+private[schema] resolve_message(r: *Resolver, i: usize, visible: Buf[usize], m: MessageDecl)
+    for k in 0..<m.fields.len()
+        var f = m.fields[k]
+        f.ty match
+            Named(written, _, _) ->
+                lookup(r.schema, m.full, written) match
+                    Ok((full, sym)) ->
+                        if !contains(visible.view(), sym.file) then
+                            r.fail(i, error(f.span, s"`$written` is declared in ${r.schema.files[sym.file].name}, which this file does not import"))
+                        else
+                            f.ty = Named(written, full, if sym.kind == MessageSym then Message else Enum)
+                            m.fields.set(k, f)
+                    Err(why) -> r.fail(i, error(f.span, why))
+            ScalarType(_) -> ()
+    for n in m.messages
+        resolve_message(r, i, visible, n)
+
+/** Finds a type name the way protoc does, from the innermost scope outward.
+ *
+ * The first part of the name is looked for in `scope`, then in each scope enclosing it, out to the
+ * root. **Once the first part is found as something a name can continue inside — a message, an enum
+ * or a package — the rest must be found inside it**, and the search does not go on outward when it is
+ * not: that is protoc's rule, and it is what makes an inner declaration shadow an outer one completely.
+ * A first part found as something else, a field say, is passed over. */
+lookup(s: Schema, scope: string, written: string) -> Result[(string, Symbol), string]
+    if written.starts_with(".") then
+        return s.symbols.get(written) match
+            Some(sym) -> if sym.kind.is_type() then Ok((written, sym)) else Err(s"`$written` is ${sym.kind.noun()}, not a type")
+            None -> Err(s"`$written` is not defined")
+    val dot = written.index_of(".")
+    val first = dot.map(d -> written[0..<d]).unwrap_or(written)
+    val rest = dot.map(d -> written[d..<written.len]).unwrap_or("")
+    var at = scope
+    loop
+        val candidate = at + "." + first
+        s.symbols.get(candidate) match
+            Some(sym) ->
+                if rest != "" then
+                    if sym.kind.aggregate() then
+                        return s.symbols.get(candidate + rest) match
+                            Some(inner) ->
+                                if inner.kind.is_type() then Ok((candidate + rest, inner))
+                                else Err(s"`$written` is ${inner.kind.noun()}, not a type")
+                            None -> Err(s"`$written` is not defined: `${bare(candidate)}` has no `${rest[1..<rest.len]}` in it")
+                elif sym.kind.is_type() then
+                    return Ok((candidate, sym))
+            None -> ()
+        if at == "" then break
+        at = at.last_index_of(".").map(d -> at[0..<d]).unwrap_or("")
+    Err(s"`$written` is not defined")
+end lookup

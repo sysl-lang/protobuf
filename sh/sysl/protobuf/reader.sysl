@@ -1,0 +1,120 @@
+module sh.sysl.protobuf
+
+/** One field's tag as it was read: its number, its wire type, and where it was. */
+struct Field derives Eq, Display
+    number: u32
+    wire: WireType
+    at: usize
+
+/** A cursor over an encoded message.
+ *
+ * `end` is where this message stops, which for a nested message is short of the input's end: a
+ * sub-message is read by a reader over the same bytes with a nearer `end`, so **every offset an
+ * error names is an offset into the whole input**, and nothing is copied to read a nested message.
+ * `depth` is how many messages enclose this one.
+ */
+struct Reader
+    bytes: []const u8
+    at: usize
+    end: usize
+    depth: usize
+
+    /** Whether there is another field before this message ends. */
+    more(self) -> bool = self.at < self.end
+
+    byte(*self) -> Result[u8, DecodeError]
+        if self.at >= self.end then return Err(Truncated(self.at))
+        val b = self.bytes[self.at]
+        self.at += 1
+        Ok(b)
+
+    varint(*self) -> Result[u64, DecodeError]
+        val start = self.at
+        var v: u64 = 0
+        for i in 0..<10
+            val b = self.byte()?
+            // The tenth byte holds bit 63 and nothing above it.
+            if i == 9 && b > 1 then return Err(Overlong(start))
+            v |= u64(b & 0x7f) << (7 * i)
+            if b < 0x80 then return Ok(v)
+        Err(Overlong(start))
+
+    fixed32(*self) -> Result[u32, DecodeError]
+        if self.end - self.at < 4 then return Err(Truncated(self.at))
+        var v: u32 = 0
+        for i in 0..<4usize
+            v |= u32(self.bytes[self.at + i]) << (8 * i)
+        self.at += 4
+        Ok(v)
+
+    fixed64(*self) -> Result[u64, DecodeError]
+        if self.end - self.at < 8 then return Err(Truncated(self.at))
+        var v: u64 = 0
+        for i in 0..<8usize
+            v |= u64(self.bytes[self.at + i]) << (8 * i)
+        self.at += 8
+        Ok(v)
+
+    /** The next field's tag. Call it only while `more()`. */
+    field(*self) -> Result[Field, DecodeError]
+        val at = self.at
+        val t = self.varint()?
+        val wire = wire_type_of(t).ok_or(BadWireType(at, u8(t & 7)))?
+        val number = t >> 3
+        if number == 0 || number > u64(max_field) then return Err(BadFieldNumber(at))
+        Ok(Field(u32(number), wire, at))
+
+    /** A length prefix and the bytes it covers, as a reader over them one level deeper. */
+    delimited(*self) -> Result[Reader, DecodeError]
+        val at = self.at
+        val n = self.varint()?
+        if n > u64(self.end - self.at) then return Err(BadLength(at))
+        if self.depth + 1 > max_depth then return Err(TooDeep(at))
+        val sub = Reader(self.bytes, self.at, self.at + usize(n), self.depth + 1)
+        self.at += usize(n)
+        Ok(sub)
+
+    /** The bytes a length prefix covers. */
+    chunk(*self) -> Result[[]const u8, DecodeError]
+        val at = self.at
+        val n = self.varint()?
+        if n > u64(self.end - self.at) then return Err(BadLength(at))
+        val from = self.at
+        self.at += usize(n)
+        Ok(self.bytes[from..<self.at])
+
+    /** Steps over a field this reader does not know, of any wire type: a group is stepped over to its
+     * matching end, however deeply groups nest inside it. */
+    skip(*self, f: Field) -> Result[unit, DecodeError]
+        f.wire match
+            Varint ->
+                self.varint()?
+                Ok(())
+            I64 -> self.skip_bytes(8)
+            I32 -> self.skip_bytes(4)
+            Len ->
+                self.chunk()?
+                Ok(())
+            SGroup ->
+                if self.depth + 1 > max_depth then return Err(TooDeep(f.at))
+                self.depth += 1
+                loop
+                    if !self.more() then return Err(Truncated(self.at))
+                    val inner = self.field()?
+                    if inner.wire == EGroup then
+                        if inner.number != f.number then return Err(BadGroup(inner.at))
+                        break
+                    self.skip(inner)?
+                self.depth -= 1
+                Ok(())
+            EGroup -> Err(BadGroup(f.at))
+    end skip
+
+    private skip_bytes(*self, n: usize) -> Result[unit, DecodeError]
+        if self.end - self.at < n then return Err(Truncated(self.at))
+        self.at += n
+        Ok(())
+end Reader
+
+/** A reader over a whole encoded message. */
+reader(bytes: []const u8) -> Reader = Reader(bytes, 0, bytes.len, 0)

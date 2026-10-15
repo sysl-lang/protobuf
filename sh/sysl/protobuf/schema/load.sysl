@@ -1,0 +1,96 @@
+module sh.sysl.protobuf.schema
+
+import sh.sysl.parsing.{error, source}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, read_text}
+import sysl.text.Search
+
+// Finding files: a set of root files, every file they import, read once each and put in an order
+// where each comes after what it imports — then resolved.
+
+/** Reads `roots` and everything they import, by the names imports use, and resolves the lot.
+ *
+ * `read` answers a file's text for its import name — `"google/protobuf/timestamp.proto"` — or `None`
+ * where there is no such file, so a caller decides where files come from: a search path on disk
+ * (`load`), or a table in memory. An import cycle, a missing file and every problem in every file
+ * are answered as rendered diagnostics. */
+load_with(roots: []const string, read: string -> Option[string]) -> Result[Schema, string]
+    var l = Loader(buf(), buf())
+    for name in roots
+        visit(&l, read, name, None)?
+    resolve(l.files)
+
+private[schema] struct Loader
+    files: Buf[ProtoFile]
+    // The files being read, outermost first, which is what an import cycle is found against.
+    open: Buf[string]
+
+// Where an import came from, for the diagnostic when it cannot be found.
+private[schema] struct From
+    file: ProtoFile
+    imp: Import
+
+private[schema] visit(l: *Loader, read: string -> Option[string], name: string, from: Option[From]) -> Result[unit, string]
+    for f in l.files
+        if f.name == name then return Ok(())
+    for k in 0..<l.open.len()
+        if l.open[k] == name then
+            val chain = l.open.view()[k..<l.open.len()]
+            var text = ""
+            for c in chain
+                text = text + c + " -> "
+            return Err(said(from, s"these files import each other in a cycle: $text$name"))
+    val text = read(name) match
+        Some(t) -> t
+        None -> return Err(said(from, s"`$name` is not found"))
+    val src = source(name, text.bytes)
+    val file = parse_file(name, src).map_err(d -> d.render(src))?
+    l.open.push(name)
+    for imp in file.imports
+        visit(l, read, imp.path, Some(From(file, imp)))?
+    l.open.pop()
+    l.files.push(file)
+    Ok(())
+
+private[schema] said(from: Option[From], text: string) -> string = from match
+    Some(f) -> error(f.imp.span, text).render(f.file.src)
+    None -> s"error: $text"
+
+/** Reads `roots` from disk and resolves them, finding each import under the first of `include` that
+ * holds it, as protoc's `-I` does.
+ *
+ * **A root is named by its path, and must be under one of `include`**: its import name is what is
+ * left of the path past that directory — which is the name its diagnostics use and the name another
+ * file imports it by. With no `include` at all the current directory is the one. */
+@needs(os)
+load(roots: []const string, include: []const string) -> Result[Schema, string]
+    val dirs: Buf[string] = buf()
+    for d in include
+        dirs.push(trimmed_dir(d))
+    if dirs.is_empty() then dirs.push(".")
+    val names: Buf[string] = buf()
+    for root in roots
+        names.push(import_name(root, dirs)?)
+    load_with(names.view(), name -> find_in(dirs, name))
+
+private[schema] trimmed_dir(d: string) -> string =
+    if d.len > 1 && d.ends_with("/") then d[0..<d.len - 1] else d
+
+// The name a root file is imported by: its path less the include directory it is under, or, as
+// protoc also allows, a name already relative to one of them.
+@needs(os)
+private[schema] import_name(root: string, dirs: Buf[string]) -> Result[string, string]
+    val path = if root.starts_with("./") then root[2..<root.len] else root
+    for d in dirs
+        if d == "." && !path.starts_with("/") then return Ok(path)
+        val prefix = d + "/"
+        if path.starts_with(prefix) then return Ok(path[prefix.len..<path.len])
+    if find_in(dirs, path).is_some() then return Ok(path)
+    Err(s"error: `$root` is not under any include directory — name the directory it is in with `-I`")
+
+@needs(os)
+private[schema] find_in(dirs: Buf[string], name: string) -> Option[string]
+    for d in dirs
+        val path = if d == "." then name else d + "/" + name
+        if exists(path) then return read_text(path).ok()
+    None

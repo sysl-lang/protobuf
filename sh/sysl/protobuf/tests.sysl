@@ -1,0 +1,231 @@
+module sh.sysl.protobuf
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The runtime's own claims, checked against the byte sequences the protobuf encoding guide gives
+// (protobuf.dev/programming-guides/encoding). The generated code and protoc check the rest.
+
+private bytes_of(xs: []const u8) -> Buf[u8]
+    val b: Buf[u8] = buf()
+    b.extend(xs)
+    b
+
+// The first field of `bytes` stepped over, and what went wrong if anything did.
+private skip_one(bytes: []const u8) -> Option[DecodeError]
+    var r = reader(bytes)
+    val f = r.field() match
+        Ok(f) -> f
+        Err(e) -> return Some(e)
+    r.skip(f).err()
+
+private encoded[C: Codec](number: u32, v: C::Value) -> Buf[u8]
+    var out = buf_output()
+    C.present(&out, number, v).unwrap()
+    assert_eq(out.bytes.len(), C.present_size(number, v))
+    out.bytes
+
+@test("varints are seven bits a byte, least significant first, with the high bit for 'more'")
+varints()
+    for (v, want) in [(0u64, [0x00u8][..]), (1, [0x01][..]), (127, [0x7f][..]), (128, [0x80, 0x01][..]),
+                      (150, [0x96, 0x01][..]), (300, [0xac, 0x02][..]),
+                      (0xffff_ffff_ffff_ffff, [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01][..])]
+        var out = buf_output()
+        out.varint(v).unwrap()
+        assert_eq(out.bytes, bytes_of(want))
+        assert_eq(varint_size(v), want.len)
+        var r = reader(want)
+        assert_eq(r.varint(), Ok(v))
+        assert(!r.more())
+
+@test("zigzag interleaves the signs: 0, -1, 1, -2, and the extremes at the top")
+zigzags()
+    assert_eq(zigzag32(0), 0)
+    assert_eq(zigzag32(-1), 1)
+    assert_eq(zigzag32(1), 2)
+    assert_eq(zigzag32(-2), 3)
+    assert_eq(zigzag32(2147483647), 0xffff_fffe)
+    assert_eq(zigzag32(-2147483648), 0xffff_ffff)
+    assert_eq(zigzag64(-1), 1)
+    assert_eq(zigzag64(-9223372036854775808), 0xffff_ffff_ffff_ffff)
+    for v in [0i32, 1, -1, 2, -2, 1000, -1000, 2147483647, -2147483648]
+        assert_eq(unzigzag32(zigzag32(v)), v)
+    for v in [0i64, -1, 1, 9223372036854775807, -9223372036854775808]
+        assert_eq(unzigzag64(zigzag64(v)), v)
+
+@test("the guide's examples: field 1 = 150, a string, a negative int32 at ten bytes, sint32 -2")
+guide_examples()
+    assert_eq(encoded[Int32](1, 150), bytes_of([0x08, 0x96, 0x01]))
+    assert_eq(encoded[Str](2, "testing"), bytes_of([0x12, 0x07, 0x74, 0x65, 0x73, 0x74, 0x69, 0x6e, 0x67]))
+    assert_eq(encoded[Int32](1, -2), bytes_of([0x08, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]))
+    assert_eq(encoded[SInt32](1, -2), bytes_of([0x08, 0x03]))
+    assert_eq(encoded[Fixed32](5, 1), bytes_of([0x2d, 0x01, 0x00, 0x00, 0x00]))
+    assert_eq(encoded[SFixed64](1, -1), bytes_of([0x09, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]))
+    assert_eq(encoded[Double](1, 1.0), bytes_of([0x09, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f]))
+    assert_eq(encoded[Float](1, -0.0f32), bytes_of([0x0d, 0, 0, 0, 0x80]))
+    assert_eq(encoded[Bool](3, true), bytes_of([0x18, 0x01]))
+
+@test("a field at its default is left out, and present writes it anyway")
+defaults_left_out()
+    var out = buf_output()
+    Int32.field(&out, 1, 0).unwrap()
+    Str.field(&out, 2, "").unwrap()
+    Bool.field(&out, 3, false).unwrap()
+    Double.field(&out, 4, 0.0).unwrap()
+    Bytes.field(&out, 5, buf()).unwrap()
+    assert_eq(out.bytes.len(), 0)
+    Double.field(&out, 4, -0.0).unwrap()
+    assert_eq(out.bytes.len(), 9)
+    Int32.present(&out, 1, 0).unwrap()
+    assert_eq(out.bytes.len(), 11)
+    assert_eq(Int32.field_size(1, 0), 0)
+    assert_eq(Int32.optional_size(1, None), 0)
+    assert_eq(Int32.optional_size(1, Some(0)), 2)
+
+@test("the guide's packed example: field 4 = [3, 270, 86942]")
+packed_example()
+    var out = buf_output()
+    val xs: []const i32 = [3, 270, 86942]
+    Int32.packed(&out, 4, xs).unwrap()
+    assert_eq(out.bytes, bytes_of([0x22, 0x06, 0x03, 0x8e, 0x02, 0x9e, 0xa7, 0x05]))
+    assert_eq(Int32.packed_size(4, xs), 8)
+    var r = reader(out.bytes.view())
+    val f = r.field().unwrap()
+    assert_eq(f, Field(4, Len, 0))
+    val got: Buf[i32] = buf()
+    Int32.read_repeated(&r, f, got).unwrap()
+    assert_eq(got.len(), 3)
+    for i in 0..<xs.len
+        assert_eq(got[i], xs[i])
+    val empty: []const i32 = []
+    assert_eq(Int32.packed_size(4, empty), 0)
+
+@test("a repeated number arriving unpacked is read the same as packed")
+unpacked_read()
+    var out = buf_output()
+    val xs: []const u32 = [1, 2, 300]
+    UInt32.repeated(&out, 7, xs).unwrap()
+    assert_eq(out.bytes.len(), UInt32.repeated_size(7, xs))
+    var r = reader(out.bytes.view())
+    val got: Buf[u32] = buf()
+    while r.more()
+        UInt32.read_repeated(&r, r.field().unwrap(), got).unwrap()
+    assert_eq(got.len(), 3)
+    for i in 0..<xs.len
+        assert_eq(got[i], xs[i])
+
+@test("a slice output answers Full at the first byte that does not fit, and writes nothing past it")
+slice_full()
+    var store: [4]u8 = [0; 4]
+    var out = slice_output(store[..])
+    assert_eq(UInt32.present(&out, 1, 300).err(), None)
+    assert_eq(out.written().len, 3)
+    assert_eq(UInt32.present(&out, 1, 300).err(), Some(Full(4)))
+    var tiny = slice_output(store[..<2])
+    assert_eq(Str.present(&tiny, 1, "abc").err(), Some(Full(2)))
+    var exact = slice_output(store[..])
+    assert_eq(Fixed32.present(&exact, 1, 7).is_err(), true)
+    var fits: [5]u8 = [0; 5]
+    var five = slice_output(fits[..])
+    assert_eq(Fixed32.present(&five, 1, 7).err(), None)
+    assert_eq(five.written(), [0x0du8, 7, 0, 0, 0][..])
+
+@test("every wire type is skipped, groups to their matching end however deep")
+skips()
+    // 1: varint 300, 2: fixed64, 3: "hi", 4: group { 5: varint 1, 6: group { } }, 7: fixed32, 8: varint 9
+    val msg: []const u8 = [0x08, 0xac, 0x02, 0x11, 1, 2, 3, 4, 5, 6, 7, 8, 0x1a, 0x02, 0x68, 0x69,
+                           0x23, 0x28, 0x01, 0x33, 0x34, 0x24, 0x3d, 1, 2, 3, 4, 0x40, 0x09]
+    var r = reader(msg)
+    var last = 0u32
+    while r.more()
+        val f = r.field().unwrap()
+        if f.number == 8 then
+            assert_eq(UInt32.read(&r, f), Ok(9))
+        else
+            r.skip(f).unwrap()
+        last = f.number
+    assert_eq(last, 8)
+
+@test("errors name the byte offset in the whole input, nested messages included")
+error_offsets()
+    // Truncated varint.
+    var a = reader([0x08, 0x80])
+    val fa = a.field().unwrap()
+    assert_eq(UInt64.read(&a, fa), Err(Truncated(2)))
+    // Eleven-byte varint.
+    var b = reader([0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01])
+    val fb = b.field().unwrap()
+    assert_eq(UInt64.read(&b, fb), Err(Overlong(1)))
+    // A tenth byte above 1.
+    var b2 = reader([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02])
+    assert_eq(b2.varint(), Err(Overlong(0)))
+    // Field 0, and wire types 6 and 7.
+    var z = reader([0x00, 0x01])
+    assert_eq(z.field(), Err(BadFieldNumber(0)))
+    var big = reader([0x80, 0x80, 0x80, 0x80, 0x10])
+    assert_eq(big.field(), Err(BadFieldNumber(0)))
+    var c = reader([0x08, 0x01, 0x0e])
+    c.skip(c.field().unwrap()).unwrap()
+    assert_eq(c.field(), Err(BadWireType(2, 6)))
+    // A length running past the end, inside a nested message whose own length is honest.
+    val nested: []const u8 = [0x0a, 0x03, 0x12, 0x05, 0x61]
+    var d = reader(nested)
+    val outer = d.field().unwrap()
+    var sub = d.delimited().unwrap()
+    assert_eq(outer.number, 1)
+    val inner = sub.field().unwrap()
+    assert_eq(Str.read(&sub, inner), Err(BadLength(3)))
+    // A known field with the wrong wire type.
+    var e = reader([0x0d, 1, 2, 3, 4])
+    val fe = e.field().unwrap()
+    assert_eq(Int32.read(&e, fe), Err(WrongWireType(0, 1, I32)))
+    // Bad UTF-8.
+    var g = reader([0x0a, 0x02, 0xc3, 0x28])
+    val fg = g.field().unwrap()
+    assert_eq(Str.read(&g, fg), Err(BadUtf8(1)))
+    // An end group that closes nothing, and one that closes the wrong group.
+    assert_eq(skip_one([0x0c]), Some(BadGroup(0)))
+    assert_eq(skip_one([0x0b, 0x14]), Some(BadGroup(1)))
+    // A group the input ends inside.
+    assert_eq(skip_one([0x0b, 0x08, 0x01]), Some(Truncated(3)))
+    // A fixed value cut short.
+    var k = reader([0x09, 1, 2, 3])
+    val fk = k.field().unwrap()
+    assert_eq(Fixed64.read(&k, fk), Err(Truncated(1)))
+
+@test("nesting past the limit is refused rather than run off the stack")
+too_deep()
+    // 101 groups opened one inside the next.
+    val deep: Buf[u8] = buf()
+    for _ in 0..<101
+        deep.push(0x0b)
+    assert_eq(skip_one(deep.view()), Some(TooDeep(100)))
+    // And 101 length-delimited levels.
+    var nest: Buf[u8] = buf()
+    for _ in 0..<101
+        val inner = nest
+        nest = buf()
+        nest.push(0x0a)
+        var size = buf_output()
+        size.varint(u64(inner.len())).unwrap()
+        nest.extend(size.bytes.view())
+        nest.extend(inner.view())
+    var level = reader(nest.view())
+    var opened = 0
+    loop
+        level.field().unwrap()
+        val length_at = level.at
+        level.delimited() match
+            Ok(sub) ->
+                level = sub
+                opened += 1
+            Err(e) ->
+                assert_eq(e, TooDeep(length_at))
+                break
+    assert_eq(opened, 100)
+
+@test("every decode error has a sentence that names its offset")
+error_text()
+    assert_eq(str(Truncated(5)), "the input ends inside a value at byte 5")
+    assert_eq(str(WrongWireType(3, 4, Len)), "field 4 at byte 3 arrived as wire type 2, which its type cannot have")
+    assert_eq(str(Full(9)), "Full(9)")
