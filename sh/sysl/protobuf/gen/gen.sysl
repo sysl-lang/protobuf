@@ -388,8 +388,6 @@ private[gen] message(g: *Gen, m: MessageDecl)
 
     val ordered = by_number(plans)
     if !plans.is_empty() then g.rt("Codec")
-    // `Message.to_bytes` answers a `Buf[u8]`, and an implementing module has to have the name.
-    g.sb("Buf")
     g.line(0, s"impl ${g.rt("Message")} for $name")
     g.line(1, s"empty() -> $name = $name(${join(defaults.view(), ", ")})")
     g.line(0, "")

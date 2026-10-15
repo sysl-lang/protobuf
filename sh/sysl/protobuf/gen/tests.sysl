@@ -113,6 +113,12 @@ tidy_output()
     assert(text.contains("struct Empty derives Eq, Display\nend Empty"))
     assert(text.contains("import sysl.buf.{Buf, buf}"))
 
+@test("a message of plain scalars imports no Buf: a trait default's signature is resolved in its own module")
+no_buf_import_without_buf_fields()
+    val text = generated("syntax = \"proto3\"; package p; message Pt { int32 x = 1; int32 y = 2; }")
+    assert(!text.contains("sysl.buf"))
+    assert(text.contains("impl Message for Pt"))
+
 @test("the command line: usage, its mistakes with status 2, a schema's with status 1")
 command_line()
     assert_eq(run_cli(["--help"]).status, 0)

@@ -47,24 +47,25 @@ extending alpha.13's module-level fix, and finding where the `malloc`/`free` ref
 A default `many(self) -> Buf[int]` in a module that imports `Buf` fails in an implementing module that
 does not: `error: unknown type 'Buf'`, pointing at an unrelated line of the impl.
 
-**WORKAROUND TAKEN — remove when fixed:** the generator always imports `sysl.buf.Buf` (the
-`g.sb("Buf")` line in `gen.sysl`'s `message()`).
+The generator used to import `sysl.buf.Buf` into every message module as a workaround; that import is
+gone, and a test pins that a scalars-only message imports no `sysl.buf`.
 
-**Status: accepted for alpha.14** (sysl branch `trait-default-scope`).
+**Status: Fixed in 0.1.0-alpha.13.**
 
 ## 5. `&T` has no `Display` even when `T` has (gap)
 
 `derives Display` on a struct holding `Option[&Node]` fails. That blocks boxing a message that contains
 itself, so the generator refuses such messages with a diagnostic for now.
 
-**Status: fixed in alpha.13** (`&T` is `Display` when `T` is). Recheck `Option[&Node]` there.
+**Status: Fixed in 0.1.0-alpha.13** (`&T` is `Display` when `T` is). Recursive messages are now
+unblocked; the generator still refuses them until that support is built.
 
 ## 6. `unit` has no `Eq` or `Display` (gap)
 
 `assert_eq(x, Ok(()))` on a `Result[unit, E]` is refused. The tests compare `.err()`. The same as
 `sysl-lang/fat`'s FINDINGS 5.
 
-**Status: fixed in alpha.13.**
+**Status: Fixed in 0.1.0-alpha.13.**
 
 ## 7. `[]int == []const int` is refused (gap)
 
