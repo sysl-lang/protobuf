@@ -10,10 +10,10 @@ probe() -> i32
     var store: [64]u8 = [0; 64]
     var out = slice_output(store[..])
     val samples: [3]u32 = [7, 300, 70000]
-    if UInt32.field(&out, 1, 42).is_err() then return 1
-    if SInt64.field(&out, 2, -5).is_err() then return 2
-    if Double.field(&out, 3, 21.5).is_err() then return 3
-    if Fixed32.packed(&out, 4, samples[..]).is_err() then return 4
+    if out.field[UInt32](1, 42).is_err() then return 1
+    if out.field[SInt64](2, -5).is_err() then return 2
+    if out.field[Double](3, 21.5).is_err() then return 3
+    if out.packed[Fixed32](4, samples[..]).is_err() then return 4
 
     var r = reader(out.written())
     var sum: u64 = 0

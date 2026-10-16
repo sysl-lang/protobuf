@@ -1,7 +1,7 @@
 # What writing protobuf found in sysl
 
-Found against sysl 0.1.0-alpha.12. Two findings had workarounds taken during the first pass, which
-Rule 9 forbids. Each is marked, says exactly where it is, and comes out when the fix ships.
+Found against sysl 0.1.0-alpha.12. Two findings had workarounds taken during the first pass; both
+came out when the fixes shipped.
 
 ## 1. Explicit type arguments on a trait method reached through a bound are refused (bug)
 
@@ -15,10 +15,10 @@ error: 'one' is a method of 'Out' — call it with 'one(…)'
 
 The same call on a concrete receiver works, and the reference documents `x.pick[int](3)` as legal. The
 same failure happens for `self.one[N]()` inside a trait default. **Effect:** the runtime's field writers
-are codec associated functions (`Int32.field(out, 1, v)`), not the planned `out.field[Int32](1, v)`.
-Revisit that API when this is fixed.
+were codec associated functions (`Int32.field(out, 1, v)`), not the planned `out.field[Int32](1, v)`.
 
-**Status: accepted for alpha.14** (sysl branch `type-args-select`).
+**Status: Fixed in sysl 0.1.x; workaround removed.** The writers are `Output` methods
+(`out.field[Int32](1, v)`).
 
 ## 2. `heap = false` checks code nothing reaches (gap)
 
@@ -37,10 +37,10 @@ extending alpha.13's module-level fix, and finding where the `malloc`/`free` ref
 `Of[int].twice()` is refused ("'Of' cannot be given type arguments where 'twice' is selected from it");
 `type OfInt = Of[int]` then `OfInt.twice()` works.
 
-**WORKAROUND TAKEN — remove when fixed:** every generated file ends with aliases such as
-`type XCodec = MessageOf[X]`.
+Every generated file used to end with aliases such as `type XCodec = MessageOf[X]`.
 
-**Status: accepted for alpha.14** (sysl branch `type-args-select`: `Of[int].twice()` becomes legal).
+**Status: Fixed in sysl 0.1.x; workaround removed.** Generated code writes `MessageOf[X]` where it
+needs the codec.
 
 ## 4. A trait default's signature is resolved in the implementing module (bug)
 

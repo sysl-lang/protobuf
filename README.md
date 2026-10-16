@@ -1,6 +1,10 @@
 # protobuf
 
-Protocol Buffers for [sysl](https://github.com/sysl-lang/sysl), written in sysl and nothing else:
+Protocol Buffers for [sysl](https://github.com/sysl-lang/sysl), written in sysl and nothing else.
+
+*An independent sysl package for Protocol Buffers. It is not affiliated with or endorsed by Protocol Buffers' authors or trademark holders.*
+
+It holds:
 
 - **a wire-format runtime** (`sh.sysl.protobuf`) — varints, zigzag, fixed-width words, length-delimited
   and packed fields, a writer into a slice you own that answers `Full` when it runs out, a growing
@@ -29,7 +33,7 @@ tools/portable/              the freestanding probe
 
 ```hocon
 dependencies {
-  protobuf { git = "github.com/sysl-lang/protobuf", version = "<the first tag>" }
+  protobuf { git = "github.com/sysl-lang/protobuf", version = "0.1.0" }
 }
 ```
 
@@ -105,18 +109,18 @@ impl Message for Person
         n += Str.repeated_size(3, self.emails.view())
         n += self.contact match
             Some(PersonContact.Phone(v)) -> Str.present_size(4, v)
-            Some(PersonContact.Preferred(v)) -> PersonPhoneTypeCodec.present_size(5, v)
+            Some(PersonContact.Preferred(v)) -> EnumOf[PersonPhoneType].present_size(5, v)
             None -> 0
         n
     end encoded_size
 
     encode[O: Output](self, out: *O) -> Result[unit, EncodeError]
-        Str.field(out, 1, self.name)?
-        Int32.field(out, 2, self.id)?
+        out.field[Str](1, self.name)?
+        out.field[Int32](2, self.id)?
         Str.repeated(out, 3, self.emails.view())?
         self.contact match
             Some(PersonContact.Phone(v)) -> Str.present(out, 4, v)?
-            Some(PersonContact.Preferred(v)) -> PersonPhoneTypeCodec.present(out, 5, v)?
+            Some(PersonContact.Preferred(v)) -> out.present[EnumOf[PersonPhoneType]](5, v)?
             None -> ()
         Ok(())
     end encode
@@ -129,7 +133,7 @@ impl Message for Person
                 2 -> self.id = Int32.read(r, f)?
                 3 -> Str.read_repeated(r, f, self.emails)?
                 4 -> self.contact = Some(PersonContact.Phone(Str.read(r, f)?))
-                5 -> self.contact = Some(PersonContact.Preferred(PersonPhoneTypeCodec.read(r, f)?))
+                5 -> self.contact = Some(PersonContact.Preferred(EnumOf[PersonPhoneType].read(r, f)?))
                 _ -> r.skip(f)?
         Ok(())
     end merge
@@ -154,10 +158,6 @@ impl ProtoEnum for PersonPhoneType
         1 -> Mobile
         2 -> Home
         _ -> Unrecognized(v)
-
-// The codecs fields of these types are written and read through.
-type PersonCodec = MessageOf[Person]
-type PersonPhoneTypeCodec = EnumOf[PersonPhoneType]
 ```
 
 and is used like this:

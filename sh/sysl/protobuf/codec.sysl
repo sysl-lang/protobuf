@@ -10,12 +10,13 @@ import sysl.text.from_utf8
  * `Str` — and every field shape is written once, here, for all of them. So a generated message says
  * what each field is by naming its codec, one line per field:
  *
- *     SInt64.field(out, 3, self.offset)?
- *     Fixed32.packed(out, 4, self.samples.view())?
+ *     out.field[SInt64](3, self.offset)?
+ *     out.packed[Fixed32](4, self.samples.view())?
  *     3 -> self.offset = SInt64.read(r, f)?
  *
  * An implementation supplies the first six members; `size` is the bytes of the value alone, after the
- * tag, and a length-delimited value's includes its length prefix. The shapes:
+ * tag, and a length-delimited value's includes its length prefix. The shapes, written through an
+ * `Output` and measured here:
  *
  * | member | writes | for |
  * |---|---|---|
@@ -34,32 +35,6 @@ trait Codec
     size(v: Self::Value) -> usize
     put[O: Output](out: *O, v: Self::Value) -> Result[unit, EncodeError]
     get(r: *Reader) -> Result[Self::Value, DecodeError]
-
-    field[O: Output](out: *O, number: u32, v: Self::Value) -> Result[unit, EncodeError]
-        if Self.is_default(v) then return Ok(())
-        Self.present(out, number, v)
-
-    present[O: Output](out: *O, number: u32, v: Self::Value) -> Result[unit, EncodeError]
-        out.tag(number, Self.wire)?
-        Self.put(out, v)
-
-    optional[O: Output](out: *O, number: u32, v: Option[Self::Value]) -> Result[unit, EncodeError]
-        v match
-            Some(x) -> Self.present(out, number, x)
-            None -> Ok(())
-
-    repeated[O: Output](out: *O, number: u32, xs: []const Self::Value) -> Result[unit, EncodeError]
-        for x in xs
-            Self.present(out, number, x)?
-        Ok(())
-
-    packed[O: Output](out: *O, number: u32, xs: []const Self::Value) -> Result[unit, EncodeError]
-        if xs.len == 0 then return Ok(())
-        out.tag(number, Len)?
-        out.varint(u64(Self.run_size(xs)))?
-        for x in xs
-            Self.put(out, x)?
-        Ok(())
 
     field_size(number: u32, v: Self::Value) -> usize =
         if Self.is_default(v) then 0 else Self.present_size(number, v)
@@ -146,8 +121,7 @@ merge_message[M: Message](r: *Reader, f: Field, into: Option[M]) -> Result[M, De
     Ok(m)
 
 /** A message field, nested as a length-delimited run of its own encoding. A generated file names one
- * per message type with an alias — `type AddressCodec = MessageOf[Address]` — and its fields are
- * written through that. */
+ * per message type — `MessageOf[Address]` — and its fields are written through that. */
 struct MessageOf[M: Message]
 end MessageOf
 
@@ -168,7 +142,7 @@ impl[M: Message] Codec for MessageOf[M]
         m.merge(&sub)?
         Ok(m)
 
-/** An enum field, carried as an `int32`. Named per enum type with an alias, as a message's is. */
+/** An enum field, carried as an `int32`. Named per enum type, as a message's is: `EnumOf[Color]`. */
 struct EnumOf[E: ProtoEnum]
 end EnumOf
 

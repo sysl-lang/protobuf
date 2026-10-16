@@ -47,21 +47,21 @@ impl Message for Scalars
     end encoded_size
 
     encode[O: Output](self, out: *O) -> Result[unit, EncodeError]
-        Double.field(out, 1, self.f_double)?
-        Float.field(out, 2, self.f_float)?
-        Int32.field(out, 3, self.f_int32)?
-        Int64.field(out, 4, self.f_int64)?
-        UInt32.field(out, 5, self.f_uint32)?
-        UInt64.field(out, 6, self.f_uint64)?
-        SInt32.field(out, 7, self.f_sint32)?
-        SInt64.field(out, 8, self.f_sint64)?
-        Fixed32.field(out, 9, self.f_fixed32)?
-        Fixed64.field(out, 10, self.f_fixed64)?
-        SFixed32.field(out, 11, self.f_sfixed32)?
-        SFixed64.field(out, 12, self.f_sfixed64)?
-        Bool.field(out, 13, self.f_bool)?
-        Str.field(out, 14, self.f_string)?
-        Bytes.field(out, 15, self.f_bytes)?
+        out.field[Double](1, self.f_double)?
+        out.field[Float](2, self.f_float)?
+        out.field[Int32](3, self.f_int32)?
+        out.field[Int64](4, self.f_int64)?
+        out.field[UInt32](5, self.f_uint32)?
+        out.field[UInt64](6, self.f_uint64)?
+        out.field[SInt32](7, self.f_sint32)?
+        out.field[SInt64](8, self.f_sint64)?
+        out.field[Fixed32](9, self.f_fixed32)?
+        out.field[Fixed64](10, self.f_fixed64)?
+        out.field[SFixed32](11, self.f_sfixed32)?
+        out.field[SFixed64](12, self.f_sfixed64)?
+        out.field[Bool](13, self.f_bool)?
+        out.field[Str](14, self.f_string)?
+        out.field[Bytes](15, self.f_bytes)?
         Ok(())
     end encode
 
@@ -116,8 +116,8 @@ impl Message for Repeats
         n += Int32.repeated_size(6, self.unpacked_int32.view())
         n += Str.repeated_size(7, self.strings.view())
         n += Bytes.repeated_size(8, self.blobs.view())
-        n += ColorCodec.packed_size(9, self.colors.view())
-        n += ScalarsCodec.repeated_size(10, self.nested.view())
+        n += EnumOf[Color].packed_size(9, self.colors.view())
+        n += MessageOf[Scalars].repeated_size(10, self.nested.view())
         n += UInt64.packed_size(11, self.packed_uint64.view())
         n += Float.packed_size(12, self.packed_float.view())
         n += SFixed64.packed_size(13, self.packed_sfixed64.view())
@@ -125,19 +125,19 @@ impl Message for Repeats
     end encoded_size
 
     encode[O: Output](self, out: *O) -> Result[unit, EncodeError]
-        Int32.packed(out, 1, self.packed_int32.view())?
-        SInt64.packed(out, 2, self.packed_sint64.view())?
-        Double.packed(out, 3, self.packed_double.view())?
-        Fixed32.packed(out, 4, self.packed_fixed32.view())?
-        Bool.packed(out, 5, self.packed_bool.view())?
-        Int32.repeated(out, 6, self.unpacked_int32.view())?
-        Str.repeated(out, 7, self.strings.view())?
-        Bytes.repeated(out, 8, self.blobs.view())?
-        ColorCodec.packed(out, 9, self.colors.view())?
-        ScalarsCodec.repeated(out, 10, self.nested.view())?
-        UInt64.packed(out, 11, self.packed_uint64.view())?
-        Float.packed(out, 12, self.packed_float.view())?
-        SFixed64.packed(out, 13, self.packed_sfixed64.view())?
+        out.packed[Int32](1, self.packed_int32.view())?
+        out.packed[SInt64](2, self.packed_sint64.view())?
+        out.packed[Double](3, self.packed_double.view())?
+        out.packed[Fixed32](4, self.packed_fixed32.view())?
+        out.packed[Bool](5, self.packed_bool.view())?
+        out.repeated[Int32](6, self.unpacked_int32.view())?
+        out.repeated[Str](7, self.strings.view())?
+        out.repeated[Bytes](8, self.blobs.view())?
+        out.packed[EnumOf[Color]](9, self.colors.view())?
+        out.repeated[MessageOf[Scalars]](10, self.nested.view())?
+        out.packed[UInt64](11, self.packed_uint64.view())?
+        out.packed[Float](12, self.packed_float.view())?
+        out.packed[SFixed64](13, self.packed_sfixed64.view())?
         Ok(())
     end encode
 
@@ -153,8 +153,8 @@ impl Message for Repeats
                 6 -> Int32.read_repeated(r, f, self.unpacked_int32)?
                 7 -> Str.read_repeated(r, f, self.strings)?
                 8 -> Bytes.read_repeated(r, f, self.blobs)?
-                9 -> ColorCodec.read_repeated(r, f, self.colors)?
-                10 -> ScalarsCodec.read_repeated(r, f, self.nested)?
+                9 -> EnumOf[Color].read_repeated(r, f, self.colors)?
+                10 -> MessageOf[Scalars].read_repeated(r, f, self.nested)?
                 11 -> UInt64.read_repeated(r, f, self.packed_uint64)?
                 12 -> Float.read_repeated(r, f, self.packed_float)?
                 13 -> SFixed64.read_repeated(r, f, self.packed_sfixed64)?
@@ -184,45 +184,45 @@ impl Message for Shapes
     empty() -> Shapes = Shapes(None, None, 0, None, buf(), buf(), Color.Unspecified, None, ShapesStatus.Unknown)
 
     encoded_size(self) -> usize
-        var n = ShapesPointCodec.optional_size(1, self.origin)
+        var n = MessageOf[ShapesPoint].optional_size(1, self.origin)
         n += self.shape match
             Some(ShapesShape.Radius(v)) -> Double.present_size(2, v)
             _ -> 0
         n += Int32.field_size(3, self.between)
         n += self.shape match
-            Some(ShapesShape.Corner(v)) -> ShapesPointCodec.present_size(4, v)
+            Some(ShapesShape.Corner(v)) -> MessageOf[ShapesPoint].present_size(4, v)
             Some(ShapesShape.Label(v)) -> Str.present_size(5, v)
             _ -> 0
         n += Int32.optional_size(6, self.maybe)
-        n += ShapesCountsEntryCodec.repeated_size(8, self.counts.view())
-        n += ShapesPointsEntryCodec.repeated_size(9, self.points.view())
-        n += ColorCodec.field_size(10, self.color)
-        n += ColorCodec.optional_size(11, self.maybe_color)
-        n += ShapesStatusCodec.field_size(12, self.status)
+        n += MessageOf[ShapesCountsEntry].repeated_size(8, self.counts.view())
+        n += MessageOf[ShapesPointsEntry].repeated_size(9, self.points.view())
+        n += EnumOf[Color].field_size(10, self.color)
+        n += EnumOf[Color].optional_size(11, self.maybe_color)
+        n += EnumOf[ShapesStatus].field_size(12, self.status)
         n += self.shape match
-            Some(ShapesShape.Fill(v)) -> ColorCodec.present_size(13, v)
+            Some(ShapesShape.Fill(v)) -> EnumOf[Color].present_size(13, v)
             _ -> 0
         n
     end encoded_size
 
     encode[O: Output](self, out: *O) -> Result[unit, EncodeError]
-        ShapesPointCodec.optional(out, 1, self.origin)?
+        out.optional[MessageOf[ShapesPoint]](1, self.origin)?
         self.shape match
-            Some(ShapesShape.Radius(v)) -> Double.present(out, 2, v)?
+            Some(ShapesShape.Radius(v)) -> out.present[Double](2, v)?
             _ -> ()
-        Int32.field(out, 3, self.between)?
+        out.field[Int32](3, self.between)?
         self.shape match
-            Some(ShapesShape.Corner(v)) -> ShapesPointCodec.present(out, 4, v)?
-            Some(ShapesShape.Label(v)) -> Str.present(out, 5, v)?
+            Some(ShapesShape.Corner(v)) -> out.present[MessageOf[ShapesPoint]](4, v)?
+            Some(ShapesShape.Label(v)) -> out.present[Str](5, v)?
             _ -> ()
-        Int32.optional(out, 6, self.maybe)?
-        ShapesCountsEntryCodec.repeated(out, 8, self.counts.view())?
-        ShapesPointsEntryCodec.repeated(out, 9, self.points.view())?
-        ColorCodec.field(out, 10, self.color)?
-        ColorCodec.optional(out, 11, self.maybe_color)?
-        ShapesStatusCodec.field(out, 12, self.status)?
+        out.optional[Int32](6, self.maybe)?
+        out.repeated[MessageOf[ShapesCountsEntry]](8, self.counts.view())?
+        out.repeated[MessageOf[ShapesPointsEntry]](9, self.points.view())?
+        out.field[EnumOf[Color]](10, self.color)?
+        out.optional[EnumOf[Color]](11, self.maybe_color)?
+        out.field[EnumOf[ShapesStatus]](12, self.status)?
         self.shape match
-            Some(ShapesShape.Fill(v)) -> ColorCodec.present(out, 13, v)?
+            Some(ShapesShape.Fill(v)) -> out.present[EnumOf[Color]](13, v)?
             _ -> ()
         Ok(())
     end encode
@@ -234,15 +234,15 @@ impl Message for Shapes
                 1 -> self.origin = Some(merge_message(r, f, self.origin)?)
                 2 -> self.shape = Some(ShapesShape.Radius(Double.read(r, f)?))
                 3 -> self.between = Int32.read(r, f)?
-                4 -> self.shape = Some(ShapesShape.Corner(ShapesPointCodec.read(r, f)?))
+                4 -> self.shape = Some(ShapesShape.Corner(MessageOf[ShapesPoint].read(r, f)?))
                 5 -> self.shape = Some(ShapesShape.Label(Str.read(r, f)?))
                 6 -> self.maybe = Some(Int32.read(r, f)?)
-                8 -> ShapesCountsEntryCodec.read_repeated(r, f, self.counts)?
-                9 -> ShapesPointsEntryCodec.read_repeated(r, f, self.points)?
-                10 -> self.color = ColorCodec.read(r, f)?
-                11 -> self.maybe_color = Some(ColorCodec.read(r, f)?)
-                12 -> self.status = ShapesStatusCodec.read(r, f)?
-                13 -> self.shape = Some(ShapesShape.Fill(ColorCodec.read(r, f)?))
+                8 -> MessageOf[ShapesCountsEntry].read_repeated(r, f, self.counts)?
+                9 -> MessageOf[ShapesPointsEntry].read_repeated(r, f, self.points)?
+                10 -> self.color = EnumOf[Color].read(r, f)?
+                11 -> self.maybe_color = Some(EnumOf[Color].read(r, f)?)
+                12 -> self.status = EnumOf[ShapesStatus].read(r, f)?
+                13 -> self.shape = Some(ShapesShape.Fill(EnumOf[Color].read(r, f)?))
                 _ -> r.skip(f)?
         Ok(())
     end merge
@@ -260,8 +260,8 @@ impl Message for ShapesPoint
         n
 
     encode[O: Output](self, out: *O) -> Result[unit, EncodeError]
-        SInt32.field(out, 1, self.x)?
-        SInt32.field(out, 2, self.y)?
+        out.field[SInt32](1, self.x)?
+        out.field[SInt32](2, self.y)?
         Ok(())
 
     merge(*self, r: *Reader) -> Result[unit, DecodeError]
@@ -287,8 +287,8 @@ impl Message for ShapesCountsEntry
         n
 
     encode[O: Output](self, out: *O) -> Result[unit, EncodeError]
-        Str.present(out, 1, self.key)?
-        Int32.present(out, 2, self.value)?
+        out.present[Str](1, self.key)?
+        out.present[Int32](2, self.value)?
         Ok(())
 
     merge(*self, r: *Reader) -> Result[unit, DecodeError]
@@ -310,12 +310,12 @@ impl Message for ShapesPointsEntry
 
     encoded_size(self) -> usize
         var n = Int32.present_size(1, self.key)
-        n += ShapesPointCodec.present_size(2, self.value)
+        n += MessageOf[ShapesPoint].present_size(2, self.value)
         n
 
     encode[O: Output](self, out: *O) -> Result[unit, EncodeError]
-        Int32.present(out, 1, self.key)?
-        ShapesPointCodec.present(out, 2, self.value)?
+        out.present[Int32](1, self.key)?
+        out.present[MessageOf[ShapesPoint]](2, self.value)?
         Ok(())
 
     merge(*self, r: *Reader) -> Result[unit, DecodeError]
@@ -368,10 +368,10 @@ impl Message for Keywords
     end encoded_size
 
     encode[O: Output](self, out: *O) -> Result[unit, EncodeError]
-        Str.field(out, 1, self.`type`)?
-        Int32.field(out, 2, self.`match`)?
-        Bool.field(out, 3, self.encode_)?
-        Str.repeated(out, 4, self.`val`.view())?
+        out.field[Str](1, self.`type`)?
+        out.field[Int32](2, self.`match`)?
+        out.field[Bool](3, self.encode_)?
+        out.repeated[Str](4, self.`val`.view())?
         Ok(())
     end encode
 
@@ -426,15 +426,3 @@ impl ProtoEnum for Color
         2 -> Green
         -3 -> Blue
         _ -> Unrecognized(v)
-
-// The codecs fields of these types are written and read through.
-type ScalarsCodec = MessageOf[Scalars]
-type RepeatsCodec = MessageOf[Repeats]
-type ShapesCodec = MessageOf[Shapes]
-type ShapesPointCodec = MessageOf[ShapesPoint]
-type ShapesCountsEntryCodec = MessageOf[ShapesCountsEntry]
-type ShapesPointsEntryCodec = MessageOf[ShapesPointsEntry]
-type ShapesStatusCodec = EnumOf[ShapesStatus]
-type KeywordsCodec = MessageOf[Keywords]
-type NothingCodec = MessageOf[Nothing]
-type ColorCodec = EnumOf[Color]

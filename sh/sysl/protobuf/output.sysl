@@ -22,6 +22,37 @@ trait Output
             x >>= 7
         self.put_byte(u8(x))
 
+    /** The field, unless `v` is its codec's default. */
+    field[C: Codec](*self, number: u32, v: C::Value) -> Result[unit, EncodeError]
+        if C.is_default(v) then return Ok(())
+        self.present[C](number, v)
+
+    /** The field, always. */
+    present[C: Codec](*self, number: u32, v: C::Value) -> Result[unit, EncodeError]
+        self.tag(number, C.wire)?
+        C.put(self, v)
+
+    /** The field when there is a value. */
+    optional[C: Codec](*self, number: u32, v: Option[C::Value]) -> Result[unit, EncodeError]
+        v match
+            Some(x) -> self.present[C](number, x)
+            None -> Ok(())
+
+    /** One field per element. */
+    repeated[C: Codec](*self, number: u32, xs: []const C::Value) -> Result[unit, EncodeError]
+        for x in xs
+            self.present[C](number, x)?
+        Ok(())
+
+    /** One length-delimited run of every element. */
+    packed[C: Codec](*self, number: u32, xs: []const C::Value) -> Result[unit, EncodeError]
+        if xs.len == 0 then return Ok(())
+        self.tag(number, Len)?
+        self.varint(u64(C.run_size(xs)))?
+        for x in xs
+            C.put(self, x)?
+        Ok(())
+
     tag(*self, number: u32, wire: WireType) -> Result[unit, EncodeError] = self.varint(tag_of(number, wire))
 
     // Little-endian, which is the format's byte order whatever the machine's is.

@@ -6,7 +6,7 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       protobuf { git = "github.com/sysl-lang/protobuf", version = "<the first tag>" }
+//       protobuf { git = "github.com/sysl-lang/protobuf", version = "0.1.0" }
 //     }
 //
 // **The runtime needs no operating system and no heap to encode**: a message is written into a slice
@@ -16,7 +16,7 @@
 
 package {
   name    = "protobuf"
-  version = "0.0.1"
+  version = "0.1.0"
 }
 
 dependencies {
