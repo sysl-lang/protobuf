@@ -33,7 +33,7 @@ tools/portable/              the freestanding probe
 
 ```hocon
 dependencies {
-  protobuf { git = "github.com/sysl-lang/protobuf", version = "0.1.0" }
+  protobuf { git = "github.com/sysl-lang/protobuf", version = "0.1.1" }
 }
 ```
 
