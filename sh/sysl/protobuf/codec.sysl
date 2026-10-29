@@ -150,9 +150,9 @@ impl[E: ProtoEnum] Codec for EnumOf[E]
     type Value = E
     static wire -> WireType = Varint
     is_default(v: E) -> bool = v.value == 0
-    size(v: E) -> usize = varint_size(u64(i64(v.value)))
-    put[O: Output](out: *O, v: E) -> Result[unit, EncodeError] = out.varint(u64(i64(v.value)))
-    get(r: *Reader) -> Result[E, DecodeError] = Ok(E.from_value(i32(r.varint()?)))
+    size(v: E) -> usize = varint_size(u64.wrap(i64(v.value)))
+    put[O: Output](out: *O, v: E) -> Result[unit, EncodeError] = out.varint(u64.wrap(i64(v.value)))
+    get(r: *Reader) -> Result[E, DecodeError] = Ok(E.from_value(i32.wrap(r.varint()?)))
 
 // -- the varint types -----------------------------------------------------------------------------
 
@@ -164,9 +164,9 @@ impl Codec for Int32
     static wire -> WireType = Varint
     is_default(v: i32) -> bool = v == 0
     // A negative int32 is sign-extended to 64 bits first, so it always takes ten bytes.
-    size(v: i32) -> usize = varint_size(u64(i64(v)))
-    put[O: Output](out: *O, v: i32) -> Result[unit, EncodeError] = out.varint(u64(i64(v)))
-    get(r: *Reader) -> Result[i32, DecodeError] = Ok(i32(r.varint()?))
+    size(v: i32) -> usize = varint_size(u64.wrap(i64(v)))
+    put[O: Output](out: *O, v: i32) -> Result[unit, EncodeError] = out.varint(u64.wrap(i64(v)))
+    get(r: *Reader) -> Result[i32, DecodeError] = Ok(i32.wrap(r.varint()?))
 
 struct Int64
 end Int64
@@ -175,9 +175,9 @@ impl Codec for Int64
     type Value = i64
     static wire -> WireType = Varint
     is_default(v: i64) -> bool = v == 0
-    size(v: i64) -> usize = varint_size(u64(v))
-    put[O: Output](out: *O, v: i64) -> Result[unit, EncodeError] = out.varint(u64(v))
-    get(r: *Reader) -> Result[i64, DecodeError] = Ok(i64(r.varint()?))
+    size(v: i64) -> usize = varint_size(u64.wrap(v))
+    put[O: Output](out: *O, v: i64) -> Result[unit, EncodeError] = out.varint(u64.wrap(v))
+    get(r: *Reader) -> Result[i64, DecodeError] = Ok(i64.wrap(r.varint()?))
 
 struct UInt32
 end UInt32
@@ -188,7 +188,7 @@ impl Codec for UInt32
     is_default(v: u32) -> bool = v == 0
     size(v: u32) -> usize = varint_size(u64(v))
     put[O: Output](out: *O, v: u32) -> Result[unit, EncodeError] = out.varint(u64(v))
-    get(r: *Reader) -> Result[u32, DecodeError] = Ok(u32(r.varint()?))
+    get(r: *Reader) -> Result[u32, DecodeError] = Ok(u32.wrap(r.varint()?))
 
 struct UInt64
 end UInt64
@@ -210,7 +210,7 @@ impl Codec for SInt32
     is_default(v: i32) -> bool = v == 0
     size(v: i32) -> usize = varint_size(u64(zigzag32(v)))
     put[O: Output](out: *O, v: i32) -> Result[unit, EncodeError] = out.varint(u64(zigzag32(v)))
-    get(r: *Reader) -> Result[i32, DecodeError] = Ok(unzigzag32(u32(r.varint()?)))
+    get(r: *Reader) -> Result[i32, DecodeError] = Ok(unzigzag32(u32.wrap(r.varint()?)))
 
 struct SInt64
 end SInt64
@@ -255,8 +255,8 @@ impl Codec for SFixed32
     static wire -> WireType = I32
     is_default(v: i32) -> bool = v == 0
     size(v: i32) -> usize = 4
-    put[O: Output](out: *O, v: i32) -> Result[unit, EncodeError] = out.fixed32(u32(v))
-    get(r: *Reader) -> Result[i32, DecodeError] = Ok(i32(r.fixed32()?))
+    put[O: Output](out: *O, v: i32) -> Result[unit, EncodeError] = out.fixed32(u32.wrap(v))
+    get(r: *Reader) -> Result[i32, DecodeError] = Ok(i32.wrap(r.fixed32()?))
 
 struct Float
 end Float
@@ -290,8 +290,8 @@ impl Codec for SFixed64
     static wire -> WireType = I64
     is_default(v: i64) -> bool = v == 0
     size(v: i64) -> usize = 8
-    put[O: Output](out: *O, v: i64) -> Result[unit, EncodeError] = out.fixed64(u64(v))
-    get(r: *Reader) -> Result[i64, DecodeError] = Ok(i64(r.fixed64()?))
+    put[O: Output](out: *O, v: i64) -> Result[unit, EncodeError] = out.fixed64(u64.wrap(v))
+    get(r: *Reader) -> Result[i64, DecodeError] = Ok(i64.wrap(r.fixed64()?))
 
 struct Double
 end Double

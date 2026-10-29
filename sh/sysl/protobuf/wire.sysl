@@ -50,9 +50,9 @@ varint_size(v: u64) -> usize
 /** Zigzag maps a signed value to an unsigned one with the small magnitudes small: 0, -1, 1, -2 are
  * 0, 1, 2, 3. It is what `sint32` and `sint64` put through a varint, since a negative `int32` is
  * sign-extended to ten bytes. */
-zigzag32(v: i32) -> u32 = u32((v << 1) ^ (v >> 31))
+zigzag32(v: i32) -> u32 = u32.wrap((v << 1) ^ (v >> 31))
 
-zigzag64(v: i64) -> u64 = u64((v << 1) ^ (v >> 63))
+zigzag64(v: i64) -> u64 = u64.wrap((v << 1) ^ (v >> 63))
 
 unzigzag32(u: u32) -> i32 = i32(u >> 1) ^ -i32(u & 1)
 

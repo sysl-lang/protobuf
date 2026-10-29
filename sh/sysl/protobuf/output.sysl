@@ -58,12 +58,12 @@ trait Output
     // Little-endian, which is the format's byte order whatever the machine's is.
     fixed32(*self, v: u32) -> Result[unit, EncodeError]
         for i in 0..<4
-            self.put_byte(u8(v >> (8 * i)))?
+            self.put_byte(u8.wrap(v >> (8 * i)))?
         Ok(())
 
     fixed64(*self, v: u64) -> Result[unit, EncodeError]
         for i in 0..<8
-            self.put_byte(u8(v >> (8 * i)))?
+            self.put_byte(u8.wrap(v >> (8 * i)))?
         Ok(())
 end Output
 
