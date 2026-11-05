@@ -280,8 +280,8 @@ private[gen] sorted(names: Buf[string]) -> Buf[string]
         var j = i
         while j > 0 && out[j - 1] > out[j]
             val t = out[j - 1]
-            out.set(j - 1, out[j])
-            out.set(j, t)
+            out[j - 1] = out[j]
+            out[j] = t
             j -= 1
     out
 
@@ -418,8 +418,8 @@ private[gen] by_number(plans: Buf[Plan]) -> Buf[Plan]
         var j = i
         while j > 0 && out[j - 1].field.number > out[j].field.number
             val t = out[j - 1]
-            out.set(j - 1, out[j])
-            out.set(j, t)
+            out[j - 1] = out[j]
+            out[j] = t
             j -= 1
     out
 
